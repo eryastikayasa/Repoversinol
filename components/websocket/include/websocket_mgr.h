@@ -13,12 +13,12 @@
 void websocket_app_start(void);
 bool websocket_is_connected(void);
 bool websocket_healthcheck(void);
-bool websocket_recovery_needed(void);
 uint32_t websocket_get_reconnect_count(void);
 UBaseType_t websocket_get_tx_queue_depth(void);
 UBaseType_t websocket_get_rx_queue_depth(void);
 void websocket_disconnect(void);
 bool websocket_tx_enqueue_audio(const uint8_t *data, size_t len, uint32_t generation);
+extern volatile bool websocket_tx_error;
 extern uint32_t websocket_connection_generation;
 extern uint32_t websocket_tx_frames;
 extern uint64_t websocket_tx_bytes;
