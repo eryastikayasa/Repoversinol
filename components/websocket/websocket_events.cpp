@@ -3,7 +3,7 @@
 #include "esp_websocket_client.h"
 
 static const char *TAG = "WS_EVENT";
-static volatile bool lifecycle_invalidated = false;
+static bool lifecycle_invalidated = false;
 
 static void invalidate_connection_generation(void)
 {
@@ -19,7 +19,6 @@ void websocket_event_handler(void *handler_args, esp_event_base_t base,
     esp_websocket_event_data_t *data = (esp_websocket_event_data_t *)event_data;
     esp_websocket_client_handle_t event_client =
         (esp_websocket_client_handle_t)handler_args;
-
     if (client && event_client && event_client != client) return;
 
     switch (event_id) {
@@ -41,7 +40,6 @@ void websocket_event_handler(void *handler_args, esp_event_base_t base,
             if (!data || !is_connected || websocket_tx_error) break;
             if ((data->op_code == 0x00 || data->op_code == 0x01 || data->op_code == 0x02) &&
                 data->data_ptr && data->data_len > 0) {
-                /* Callback only hands transport data to the RX worker. */
                 websocket_rx_enqueue_data(data, websocket_connection_generation);
             }
             break;

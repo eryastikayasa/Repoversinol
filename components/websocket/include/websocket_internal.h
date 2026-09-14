@@ -49,7 +49,7 @@ extern esp_websocket_client_handle_t client;
 extern volatile bool is_connected;
 extern volatile bool setup_complete;
 extern volatile bool websocket_tx_error;
-extern volatile uint32_t websocket_connection_generation;
+extern uint32_t websocket_connection_generation;
 extern char session_handle[SESSION_HANDLE_MAX_LEN];
 extern bool session_resumable;
 
@@ -70,7 +70,6 @@ extern uint32_t websocket_tx_drops;
 extern UBaseType_t websocket_tx_high_water;
 extern uint64_t websocket_tx_write_total_us;
 extern uint32_t websocket_tx_write_max_us;
-
 extern uint32_t websocket_rx_messages;
 extern uint32_t websocket_rx_fragments;
 extern uint32_t websocket_rx_drops;

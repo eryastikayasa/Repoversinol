@@ -14,7 +14,7 @@ esp_websocket_client_handle_t client = NULL;
 volatile bool is_connected = false;
 volatile bool setup_complete = false;
 volatile bool websocket_tx_error = false;
-volatile uint32_t websocket_connection_generation = 0;
+uint32_t websocket_connection_generation = 0;
 char session_handle[SESSION_HANDLE_MAX_LEN] = {0};
 bool session_resumable = false;
 
@@ -79,7 +79,6 @@ static void websocket_tx_task(void *arg)
     for (;;) {
         if (xQueueReceive(websocket_tx_queue, &cmd, portMAX_DELAY) != pdTRUE) continue;
         if (cmd.generation != websocket_connection_generation || !is_connected || websocket_tx_error || !client) continue;
-
         esp_websocket_client_handle_t ws = client;
         if (!esp_websocket_client_is_connected(ws)) continue;
 
@@ -95,36 +94,27 @@ static void websocket_tx_task(void *arg)
         }
 
         if (cmd.type != WS_TX_COMMAND_AUDIO || cmd.len != WS_TX_AUDIO_SIZE) continue;
-
         size_t encoded_len = 0;
         int ret = mbedtls_base64_encode((unsigned char *)b64_buf, sizeof(b64_buf) - 1,
                                         &encoded_len, cmd.data, cmd.len);
-        if (ret != 0) {
-            ++websocket_tx_drops;
-            continue;
-        }
+        if (ret != 0) { ++websocket_tx_drops; continue; }
         b64_buf[encoded_len] = '\0';
         int json_len = snprintf(json_buf, sizeof(json_buf),
             "{\"realtimeInput\":{\"audio\":{\"mimeType\":\"audio/pcm;rate=16000\",\"data\":\"%s\"}}}",
             b64_buf);
-        if (json_len <= 0 || (size_t)json_len >= sizeof(json_buf)) {
-            ++websocket_tx_drops;
-            continue;
-        }
+        if (json_len <= 0 || (size_t)json_len >= sizeof(json_buf)) { ++websocket_tx_drops; continue; }
 
         int64_t start_us = esp_timer_get_time();
         int sent = esp_websocket_client_send_text(ws, json_buf, json_len, 100);
         uint32_t write_us = (uint32_t)(esp_timer_get_time() - start_us);
         websocket_tx_write_total_us += write_us;
         if (write_us > websocket_tx_write_max_us) websocket_tx_write_max_us = write_us;
-
         if (sent == json_len) {
             ++websocket_tx_frames;
             websocket_tx_bytes += cmd.len;
         } else {
             ++websocket_tx_drops;
-            ESP_LOGW(TAG, "TX write fail: sent=%d expected=%d write_us=%u",
-                     sent, json_len, (unsigned)write_us);
+            ESP_LOGW(TAG, "TX write fail: sent=%d expected=%d write_us=%u", sent, json_len, (unsigned)write_us);
         }
     }
 }
@@ -146,16 +136,12 @@ bool websocket_tx_enqueue_audio(const uint8_t *data, size_t len, uint32_t genera
 {
     if (!data || len != WS_TX_AUDIO_SIZE || !websocket_tx_queue || !is_connected ||
         !setup_complete || websocket_tx_error || generation != websocket_connection_generation) return false;
-
     ws_tx_command_t cmd = {};
     cmd.type = WS_TX_COMMAND_AUDIO;
     cmd.generation = generation;
     cmd.len = (uint16_t)len;
     memcpy(cmd.data, data, WS_TX_AUDIO_SIZE);
-    if (xQueueSend(websocket_tx_queue, &cmd, 0) != pdTRUE) {
-        ++websocket_tx_drops;
-        return false;
-    }
+    if (xQueueSend(websocket_tx_queue, &cmd, 0) != pdTRUE) { ++websocket_tx_drops; return false; }
     UBaseType_t waiting = uxQueueMessagesWaiting(websocket_tx_queue);
     if (waiting > websocket_tx_high_water) websocket_tx_high_water = waiting;
     return true;
@@ -203,15 +189,11 @@ void websocket_app_start(void)
     esp_err_t err = esp_websocket_register_events(client, WEBSOCKET_EVENT_ANY,
                                                    websocket_event_handler, (void *)client);
     if (err != ESP_OK) {
-        esp_websocket_client_destroy(client);
-        client = NULL;
-        return;
+        esp_websocket_client_destroy(client); client = NULL; return;
     }
     err = esp_websocket_client_start(client);
     if (err != ESP_OK) {
-        esp_websocket_client_destroy(client);
-        client = NULL;
-        return;
+        esp_websocket_client_destroy(client); client = NULL; return;
     }
     ws_started = true;
     ESP_LOGI(TAG, "Gemini Live client started");
@@ -227,7 +209,4 @@ void websocket_disconnect(void)
     if (client) esp_websocket_client_close(client, pdMS_TO_TICKS(1000));
 }
 
-void websocket_reset_started(void)
-{
-    ws_started = false;
-}
+void websocket_reset_started(void) { ws_started = false; }
