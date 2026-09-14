@@ -1,4 +1,5 @@
 #pragma once
+
 #include "websocket_mgr.h"
 #include "esp_websocket_client.h"
 #include "freertos/FreeRTOS.h"
@@ -9,16 +10,20 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* Google Gemini Live: raw PCM16 mono 16 kHz uplink, JSON over WSS. */
 #define SESSION_HANDLE_MAX_LEN 1024
-#define WS_TX_AUDIO_SIZE 640
-#define WS_TX_QUEUE_LENGTH 3
+#define WS_TX_AUDIO_SIZE 640                 /* 320 samples = 20 ms @ 16 kHz */
+#define WS_TX_QUEUE_LENGTH 3                 /* freshness-first bounded queue */
 #define WS_RX_MAX_PAYLOAD_SIZE (48 * 1024)
 #define WS_RX_FRAGMENT_SIZE (8 * 1024)
 #define WS_RX_POOL_COUNT 4
 #define WS_RX_QUEUE_LENGTH WS_RX_POOL_COUNT
 
-// Realtime audio must not be held by the transport for the 100 ms legacy timeout.
-// 10 ms is intentionally below one 20 ms PCM frame period.
+/*
+ * esp_websocket_client exposes a per-send RTOS timeout, not an end-to-end
+ * deadline. Keep the realtime send budget small; a failed send invalidates the
+ * current generation and stale audio is never retried.
+ */
 #define WS_TX_AUDIO_SEND_TIMEOUT_MS 10
 #define WS_TX_AUDIO_SLOW_THRESHOLD_US 30000
 
@@ -29,6 +34,7 @@ typedef struct {
     uint16_t len;
     uint8_t data[WS_TX_AUDIO_SIZE];
 } ws_tx_command_t;
+
 extern QueueHandle_t websocket_tx_queue;
 extern TaskHandle_t websocket_tx_task_handle;
 bool websocket_tx_init(void);
@@ -42,6 +48,7 @@ typedef struct {
     uint16_t len;
     uint8_t pool_index;
 } ws_rx_fragment_t;
+
 extern QueueHandle_t websocket_rx_queue;
 extern QueueHandle_t websocket_rx_free_queue;
 extern TaskHandle_t websocket_rx_task_handle;
