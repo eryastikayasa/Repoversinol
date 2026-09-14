@@ -28,6 +28,7 @@ void websocket_event_handler(void *handler_args, esp_event_base_t base,
             setup_complete = false;
             websocket_tx_error = false;
             ++websocket_connection_generation;
+            websocket_note_connected();
             ESP_LOGI(TAG, "WebSocket CONNECTED generation=%lu",
                      (unsigned long)websocket_connection_generation);
             websocket_tx_flush_queue();
