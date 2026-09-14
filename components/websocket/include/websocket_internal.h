@@ -30,6 +30,7 @@ bool websocket_tx_init(void);
 bool websocket_tx_enqueue_audio(const uint8_t *data, size_t len, uint32_t generation);
 void websocket_tx_flush_queue(void);
 
+// RX fragments are copied into a fixed PSRAM/internal pool before the event callback returns.
 typedef struct {
     uint32_t generation;
     uint32_t payload_len;
@@ -70,6 +71,7 @@ extern uint32_t websocket_tx_drops;
 extern UBaseType_t websocket_tx_high_water;
 extern uint64_t websocket_tx_write_total_us;
 extern uint32_t websocket_tx_write_max_us;
+extern uint32_t websocket_tx_write_slow;
 extern uint32_t websocket_rx_messages;
 extern uint32_t websocket_rx_fragments;
 extern uint32_t websocket_rx_drops;
@@ -79,6 +81,7 @@ extern uint32_t websocket_rx_process_max_us;
 
 void websocket_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data);
 void websocket_schedule_setup(uint32_t generation);
+void websocket_cleanup_finished(esp_websocket_client_handle_t old_client);
 void reset_rx_buffer(void);
 bool ensure_rx_buffer(size_t required_size);
 void process_websocket_payload(esp_websocket_event_data_t *data);
