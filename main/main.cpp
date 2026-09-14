@@ -12,6 +12,10 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#ifndef VOICE_SYNTHETIC_TEST
+#define VOICE_SYNTHETIC_TEST 0
+#endif
+
 static const char *TAG = "MAIN";
 static constexpr size_t AUDIO_FRAME_BYTES = 640;
 
@@ -19,6 +23,11 @@ static void audio_capture_task(void *arg)
 {
     (void)arg;
     static uint8_t frame[AUDIO_FRAME_BYTES];
+#if VOICE_SYNTHETIC_TEST
+    static const int16_t tone[16] = {0, 2296, 4243, 5543, 6000, 5543, 4243, 2296,
+                                     0, -2296, -4243, -5543, -6000, -5543, -4243, -2296};
+    static size_t tone_pos = 0;
+#endif
     uint64_t frames = 0;
     int64_t last_us = 0;
     uint64_t interval_total_us = 0;
@@ -26,22 +35,32 @@ static void audio_capture_task(void *arg)
     uint32_t drops = 0;
     int64_t last_log_us = esp_timer_get_time();
 
+#if VOICE_SYNTHETIC_TEST
+    ESP_LOGW(TAG, "TEST A ENABLED: synthetic PCM16 16kHz mono, 640 bytes every 20ms");
+#else
     ESP_LOGI(TAG, "MIC: PCM16 mono 16kHz, 320 samples / 640 bytes / 20ms");
+#endif
 
     for (;;) {
+#if VOICE_SYNTHETIC_TEST
+        int16_t *pcm = reinterpret_cast<int16_t *>(frame);
+        for (size_t i = 0; i < AUDIO_FRAME_BYTES / sizeof(int16_t); ++i) {
+            pcm[i] = tone[tone_pos++ & 15];
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+        int64_t now_us = esp_timer_get_time();
+#else
         size_t got = audio_read_mic(frame, sizeof(frame));
         int64_t now_us = esp_timer_get_time();
+        if (got != sizeof(frame)) { ++drops; continue; }
+#endif
+
         if (last_us != 0) {
             uint32_t interval = (uint32_t)(now_us - last_us);
             interval_total_us += interval;
             if (interval > interval_max_us) interval_max_us = interval;
         }
         last_us = now_us;
-
-        if (got != sizeof(frame)) {
-            ++drops;
-            continue;
-        }
 
         ++frames;
         if (websocket_is_connected() && !websocket_tx_enqueue_audio(frame, sizeof(frame), websocket_connection_generation))
@@ -50,32 +69,22 @@ static void audio_capture_task(void *arg)
         if (now_us - last_log_us >= 5000000) {
             last_log_us = now_us;
             uint32_t avg_interval = frames > 1 ? (uint32_t)(interval_total_us / (frames - 1)) : 0;
-            ESP_LOGI(TAG,
-                     "MIC profile: frames=%llu interval_avg_us=%lu interval_max_us=%lu drops=%lu heap=%u psram=%u",
-                     (unsigned long long)frames,
-                     (unsigned long)avg_interval,
-                     (unsigned long)interval_max_us,
-                     (unsigned long)drops,
+            ESP_LOGI(TAG, "MIC/TEST profile: frames=%llu interval_avg_us=%lu interval_max_us=%lu drops=%lu heap=%u psram=%u",
+                     (unsigned long long)frames, (unsigned long)avg_interval,
+                     (unsigned long)interval_max_us, (unsigned long)drops,
                      (unsigned)esp_get_free_heap_size(),
                      (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
             uint32_t tx_avg = websocket_tx_frames ?
                 (uint32_t)(websocket_tx_write_total_us / websocket_tx_frames) : 0;
             uint32_t rx_avg = websocket_rx_messages ?
                 (uint32_t)(websocket_rx_process_total_us / websocket_rx_messages) : 0;
-            ESP_LOGI(TAG,
-                     "VOICE profile: TX frames=%lu bytes=%llu drops=%lu q_hwm=%u write_avg_us=%lu write_max_us=%lu | RX msg=%lu frag=%lu drops=%lu q_hwm=%u process_avg_us=%lu process_max_us=%lu",
-                     (unsigned long)websocket_tx_frames,
-                     (unsigned long long)websocket_tx_bytes,
-                     (unsigned long)websocket_tx_drops,
-                     (unsigned)websocket_tx_high_water,
-                     (unsigned long)tx_avg,
-                     (unsigned long)websocket_tx_write_max_us,
-                     (unsigned long)websocket_rx_messages,
-                     (unsigned long)websocket_rx_fragments,
-                     (unsigned long)websocket_rx_drops,
-                     (unsigned)websocket_rx_high_water,
-                     (unsigned long)rx_avg,
-                     (unsigned long)websocket_rx_process_max_us);
+            ESP_LOGI(TAG, "VOICE profile: TX frames=%lu bytes=%llu drops=%lu q_hwm=%u write_avg_us=%lu write_max_us=%lu | RX msg=%lu frag=%lu drops=%lu q_hwm=%u process_avg_us=%lu process_max_us=%lu",
+                     (unsigned long)websocket_tx_frames, (unsigned long long)websocket_tx_bytes,
+                     (unsigned long)websocket_tx_drops, (unsigned)websocket_tx_high_water,
+                     (unsigned long)tx_avg, (unsigned long)websocket_tx_write_max_us,
+                     (unsigned long)websocket_rx_messages, (unsigned long)websocket_rx_fragments,
+                     (unsigned long)websocket_rx_drops, (unsigned)websocket_rx_high_water,
+                     (unsigned long)rx_avg, (unsigned long)websocket_rx_process_max_us);
         }
     }
 }
