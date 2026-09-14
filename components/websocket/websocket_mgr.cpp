@@ -272,6 +272,16 @@ uint32_t websocket_get_reconnect_count(void)
     return ws_reconnect_count;
 }
 
+UBaseType_t websocket_get_tx_queue_depth(void)
+{
+    return websocket_tx_queue ? uxQueueMessagesWaiting(websocket_tx_queue) : 0;
+}
+
+UBaseType_t websocket_get_rx_queue_depth(void)
+{
+    return websocket_rx_queue ? uxQueueMessagesWaiting(websocket_rx_queue) : 0;
+}
+
 void websocket_disconnect(void)
 {
     esp_websocket_client_handle_t ws = client;
