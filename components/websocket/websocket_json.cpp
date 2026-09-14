@@ -10,11 +10,7 @@
 static const char *TAG = "WS_JSON";
 static uint8_t pcm_decode_buffer[24 * 1024];
 
-void clear_session_handle(void)
-{
-    session_handle[0] = '\0';
-    session_resumable = false;
-}
+void clear_session_handle(void) { session_handle[0] = '\0'; session_resumable = false; }
 
 bool store_session_handle(const char *handle)
 {
@@ -29,8 +25,7 @@ bool store_session_handle(const char *handle)
 bool build_gemini_setup(char **output, size_t *output_len)
 {
     if (!output || !output_len) return false;
-    *output = NULL;
-    *output_len = 0;
+    *output = NULL; *output_len = 0;
 
     cJSON *root = cJSON_CreateObject();
     if (!root) return false;
@@ -57,17 +52,17 @@ bool build_gemini_setup(char **output, size_t *output_len)
     if (session_resumable && session_handle[0])
         cJSON_AddStringToObject(resume, "handle", session_handle);
 
+    /* Live API uses one compression mechanism. SlidingWindow is the mechanism;
+       targetTokens controls how much context is retained after compression. */
     cJSON *compression = cJSON_AddObjectToObject(setup, "contextWindowCompression");
-    cJSON_AddNumberToObject(compression, "triggerTokens", 25000);
     cJSON *window = cJSON_AddObjectToObject(compression, "slidingWindow");
     cJSON_AddNumberToObject(window, "targetTokens", 12500);
 
     char *json = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
     if (!json) return false;
-    *output = json;
-    *output_len = strlen(json);
-    ESP_LOGI(TAG, "Gemini setup: AUDIO + AAD + resumption + 25k/12.5k context compression");
+    *output = json; *output_len = strlen(json);
+    ESP_LOGI(TAG, "Gemini setup: AUDIO + AAD + session resumption + sliding-window compression");
     return true;
 }
 
@@ -82,10 +77,7 @@ static bool decode_audio(cJSON *inline_data)
     int ret = mbedtls_base64_decode(NULL, 0, &pcm_len,
                                     (const unsigned char *)audio->valuestring, b64_len);
     if (ret != 0 && ret != MBEDTLS_ERR_BASE64_BUFFER_TOO_SMALL) return false;
-    if (pcm_len == 0 || pcm_len > sizeof(pcm_decode_buffer)) {
-        ESP_LOGW(TAG, "RX audio too large: pcm=%u", (unsigned)pcm_len);
-        return false;
-    }
+    if (pcm_len == 0 || pcm_len > sizeof(pcm_decode_buffer)) return false;
     size_t decoded = pcm_len;
     ret = mbedtls_base64_decode(pcm_decode_buffer, sizeof(pcm_decode_buffer), &decoded,
                                 (const unsigned char *)audio->valuestring, b64_len);
@@ -115,8 +107,7 @@ void process_gemini_message(const char *json, size_t len)
     if (cJSON_IsObject(resume_update)) {
         cJSON *handle = cJSON_GetObjectItem(resume_update, "newHandle");
         cJSON *resumable = cJSON_GetObjectItem(resume_update, "resumable");
-        if (cJSON_IsTrue(resumable) && cJSON_IsString(handle))
-            store_session_handle(handle->valuestring);
+        if (cJSON_IsTrue(resumable) && cJSON_IsString(handle)) store_session_handle(handle->valuestring);
     }
 
     cJSON *server = cJSON_GetObjectItem(root, "serverContent");
@@ -131,19 +122,16 @@ void process_gemini_message(const char *json, size_t len)
                     ESP_LOGW(TAG, "RX audio decode/queue failed");
             }
         }
-
         if (cJSON_IsTrue(cJSON_GetObjectItem(server, "turnComplete"))) {
             audio_turn_complete_pending = true;
             check_audio_playback_complete();
             ESP_LOGI(TAG, "Gemini TURN COMPLETE");
         }
-
         if (cJSON_IsTrue(cJSON_GetObjectItem(server, "interrupted"))) {
             clear_audio_buffer();
             audio_turn_complete_pending = false;
             audio_turn_active = false;
         }
     }
-
     cJSON_Delete(root);
 }
