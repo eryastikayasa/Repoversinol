@@ -21,6 +21,7 @@ extern uint32_t websocket_tx_drops;
 extern UBaseType_t websocket_tx_high_water;
 extern uint64_t websocket_tx_write_total_us;
 extern uint32_t websocket_tx_write_max_us;
+extern uint32_t websocket_tx_write_slow;
 extern uint32_t websocket_rx_messages;
 extern uint32_t websocket_rx_fragments;
 extern uint32_t websocket_rx_drops;
