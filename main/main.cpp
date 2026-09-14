@@ -71,8 +71,12 @@ static void audio_capture_task(void *arg)
         if (now_us - last_log_us >= 5000000) {
             last_log_us = now_us;
             uint32_t avg_interval = frames > 1 ? (uint32_t)(interval_total_us / (frames - 1)) : 0;
-            uint32_t tx_avg = websocket_tx_frames ?
-                (uint32_t)(websocket_tx_write_total_us / websocket_tx_frames) : 0;
+            uint32_t tx_encode_avg = websocket_tx_encode_count ?
+                (uint32_t)(websocket_tx_encode_total_us / websocket_tx_encode_count) : 0;
+            uint32_t tx_json_avg = websocket_tx_json_count ?
+                (uint32_t)(websocket_tx_json_total_us / websocket_tx_json_count) : 0;
+            uint32_t tx_write_avg = websocket_tx_write_count ?
+                (uint32_t)(websocket_tx_write_total_us / websocket_tx_write_count) : 0;
             uint32_t rx_avg = websocket_rx_messages ?
                 (uint32_t)(websocket_rx_process_total_us / websocket_rx_messages) : 0;
             ESP_LOGI(TAG, "MIC profile: frames=%llu interval_avg_us=%lu interval_max_us=%lu drops=%lu heap=%u psram=%u",
@@ -80,15 +84,31 @@ static void audio_capture_task(void *arg)
                      (unsigned long)interval_max_us, (unsigned long)drops,
                      (unsigned)esp_get_free_heap_size(),
                      (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
-            ESP_LOGI(TAG, "VOICE profile: gen=%lu TX q=%u/%u hwm=%u frames=%lu bytes=%llu drops=%lu write_avg_us=%lu write_max_us=%lu slow=%lu | RX q=%u/%u hwm=%u msg=%lu frag=%lu drops=%lu process_avg_us=%lu process_max_us=%lu | WiFi reconnect=%lu WS reconnect=%lu",
-                     (unsigned long)websocket_connection_generation,
-                     (unsigned)websocket_get_tx_queue_depth(), (unsigned)3, (unsigned)websocket_tx_high_water,
-                     (unsigned long)websocket_tx_frames, (unsigned long long)websocket_tx_bytes,
-                     (unsigned long)websocket_tx_drops, (unsigned long)tx_avg,
-                     (unsigned long)websocket_tx_write_max_us, (unsigned long)websocket_tx_write_slow,
-                     (unsigned)websocket_get_rx_queue_depth(), (unsigned)4, (unsigned)websocket_rx_high_water,
-                     (unsigned long)websocket_rx_messages, (unsigned long)websocket_rx_fragments,
-                     (unsigned long)websocket_rx_drops, (unsigned long)rx_avg,
+            ESP_LOGI(TAG, "TX profile: q=%u/3 hwm=%u frames=%lu bytes=%llu drops=%lu | encode=%lu avg=%lu max=%lu | json=%lu avg=%lu max=%lu | write=%lu avg=%lu max=%lu slow=%lu fail=%lu timeout=%lu",
+                     (unsigned)websocket_get_tx_queue_depth(),
+                     (unsigned)websocket_tx_high_water,
+                     (unsigned long)websocket_tx_frames,
+                     (unsigned long long)websocket_tx_bytes,
+                     (unsigned long)websocket_tx_drops,
+                     (unsigned long)websocket_tx_encode_count,
+                     (unsigned long)tx_encode_avg,
+                     (unsigned long)websocket_tx_encode_max_us,
+                     (unsigned long)websocket_tx_json_count,
+                     (unsigned long)tx_json_avg,
+                     (unsigned long)websocket_tx_json_max_us,
+                     (unsigned long)websocket_tx_write_count,
+                     (unsigned long)tx_write_avg,
+                     (unsigned long)websocket_tx_write_max_us,
+                     (unsigned long)websocket_tx_write_slow,
+                     (unsigned long)websocket_tx_write_fail,
+                     (unsigned long)websocket_tx_write_timeout);
+            ESP_LOGI(TAG, "RX profile: q=%u/4 hwm=%u msg=%lu frag=%lu drops=%lu process_avg_us=%lu process_max_us=%lu | WiFi reconnect=%lu WS reconnect=%lu",
+                     (unsigned)websocket_get_rx_queue_depth(),
+                     (unsigned)websocket_rx_high_water,
+                     (unsigned long)websocket_rx_messages,
+                     (unsigned long)websocket_rx_fragments,
+                     (unsigned long)websocket_rx_drops,
+                     (unsigned long)rx_avg,
                      (unsigned long)websocket_rx_process_max_us,
                      (unsigned long)wifi_get_reconnect_count(),
                      (unsigned long)websocket_get_reconnect_count());
@@ -102,9 +122,15 @@ static void session_supervisor_task(void *arg)
     for (;;) {
         const bool wifi_ready = wifi_is_ready();
 
-        // Network loss must invalidate the voice session immediately; audio capture keeps its 20 ms cadence.
+        // Network/TX failure invalidates the voice session immediately; audio capture keeps its 20 ms cadence.
         if (!wifi_ready) {
             websocket_disconnect();
+        } else if (websocket_tx_error) {
+            // Recovery is intentionally kept out of the realtime TX worker. A transport
+            // failure may already have caused esp_websocket_client to abort the socket;
+            // this supervisor performs the potentially blocking close/reconnect path.
+            websocket_disconnect();
+            if (!websocket_is_connected()) websocket_app_start();
         } else {
             (void)websocket_healthcheck();
             if (!websocket_is_connected()) websocket_app_start();
