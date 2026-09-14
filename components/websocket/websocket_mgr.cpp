@@ -34,6 +34,8 @@ static volatile bool ws_close_requested = false;
 static volatile bool ws_cleanup_pending = false;
 static QueueHandle_t ws_cleanup_queue = NULL;
 static TaskHandle_t ws_cleanup_task_handle = NULL;
+static int64_t ws_connected_since_us = 0;
+static uint32_t ws_reconnect_count = 0;
 
 QueueHandle_t websocket_tx_queue = NULL;
 TaskHandle_t websocket_tx_task_handle = NULL;
@@ -167,20 +169,17 @@ bool websocket_tx_init(void)
         if (!ws_cleanup_queue) return false;
     }
     if (!ws_cleanup_task_handle) {
-        if (xTaskCreatePinnedToCore(websocket_cleanup_task, "ws_cleanup", 3072, NULL, 2,
-                                    &ws_cleanup_task_handle, 0) != pdPASS) return false;
+        if (xTaskCreatePinnedToCore(websocket_cleanup_task, "ws_cleanup", 3072, NULL, 2, &ws_cleanup_task_handle, 0) != pdPASS) return false;
     }
     if (!websocket_tx_task_handle) {
-        if (xTaskCreatePinnedToCore(websocket_tx_task, "ws_tx", 8192, NULL, 5,
-                                    &websocket_tx_task_handle, 1) != pdPASS) return false;
+        if (xTaskCreatePinnedToCore(websocket_tx_task, "ws_tx", 8192, NULL, 5, &websocket_tx_task_handle, 1) != pdPASS) return false;
     }
     return true;
 }
 
 bool websocket_tx_enqueue_audio(const uint8_t *data, size_t len, uint32_t generation)
 {
-    if (!data || len != WS_TX_AUDIO_SIZE || !websocket_tx_queue || !is_connected ||
-        !setup_complete || websocket_tx_error || generation != websocket_connection_generation) return false;
+    if (!data || len != WS_TX_AUDIO_SIZE || !websocket_tx_queue || !is_connected || !setup_complete || websocket_tx_error || generation != websocket_connection_generation) return false;
     ws_tx_command_t cmd = {};
     cmd.type = WS_TX_COMMAND_AUDIO;
     cmd.generation = generation;
@@ -189,8 +188,7 @@ bool websocket_tx_enqueue_audio(const uint8_t *data, size_t len, uint32_t genera
 
     if (xQueueSend(websocket_tx_queue, &cmd, 0) != pdTRUE) {
         ws_tx_command_t oldest = {};
-        if (xQueueReceive(websocket_tx_queue, &oldest, 0) == pdTRUE &&
-            xQueueSend(websocket_tx_queue, &cmd, 0) == pdTRUE) {
+        if (xQueueReceive(websocket_tx_queue, &oldest, 0) == pdTRUE && xQueueSend(websocket_tx_queue, &cmd, 0) == pdTRUE) {
             ++websocket_tx_drops;
             ESP_LOGD(TAG, "TX queue full: dropped oldest PCM frame");
         } else {
@@ -209,8 +207,7 @@ void websocket_schedule_setup(uint32_t generation)
     ws_tx_command_t cmd = {};
     cmd.type = WS_TX_COMMAND_SETUP;
     cmd.generation = generation;
-    if (xQueueSendToFront(websocket_tx_queue, &cmd, pdMS_TO_TICKS(100)) != pdTRUE)
-        ESP_LOGW(TAG, "SETUP queue full");
+    if (xQueueSendToFront(websocket_tx_queue, &cmd, pdMS_TO_TICKS(100)) != pdTRUE) ESP_LOGW(TAG, "SETUP queue full");
 }
 
 void websocket_app_start(void)
@@ -227,6 +224,8 @@ void websocket_app_start(void)
     setup_complete = false;
     websocket_tx_error = false;
     ws_close_requested = false;
+    ws_connected_since_us = 0;
+    ++ws_reconnect_count;
 
     esp_websocket_client_config_t cfg = {};
     cfg.uri = WEBSOCKET_SERVER_URL;
@@ -243,21 +242,12 @@ void websocket_app_start(void)
 
     client = esp_websocket_client_init(&cfg);
     if (!client) return;
-    esp_err_t err = esp_websocket_register_events(client, WEBSOCKET_EVENT_ANY,
-                                                   websocket_event_handler, (void *)client);
-    if (err != ESP_OK) {
-        esp_websocket_client_destroy(client);
-        client = NULL;
-        return;
-    }
+    esp_err_t err = esp_websocket_register_events(client, WEBSOCKET_EVENT_ANY, websocket_event_handler, (void *)client);
+    if (err != ESP_OK) { esp_websocket_client_destroy(client); client = NULL; return; }
     err = esp_websocket_client_start(client);
-    if (err != ESP_OK) {
-        esp_websocket_client_destroy(client);
-        client = NULL;
-        return;
-    }
+    if (err != ESP_OK) { esp_websocket_client_destroy(client); client = NULL; return; }
     ws_started = true;
-    ESP_LOGI(TAG, "Gemini Live client started");
+    ESP_LOGI(TAG, "Gemini Live client started; reconnect_count=%lu", (unsigned long)ws_reconnect_count);
 }
 
 bool websocket_is_connected(void)
@@ -265,11 +255,35 @@ bool websocket_is_connected(void)
     return is_connected && setup_complete && !websocket_tx_error;
 }
 
+bool websocket_healthcheck(void)
+{
+    if (!is_connected || websocket_tx_error) return false;
+    if (setup_complete) return true;
+    if (ws_connected_since_us != 0 && esp_timer_get_time() - ws_connected_since_us > 15000000LL) {
+        ESP_LOGW(TAG, "Gemini setup timeout; requesting recovery");
+        websocket_disconnect();
+        return false;
+    }
+    return true;
+}
+
+uint32_t websocket_get_reconnect_count(void)
+{
+    return ws_reconnect_count;
+}
+
 void websocket_disconnect(void)
 {
     esp_websocket_client_handle_t ws = client;
     if (!ws || ws_close_requested) return;
     ws_close_requested = true;
+    is_connected = false;
+    setup_complete = false;
+    websocket_tx_error = true;
+    ++websocket_connection_generation;
+    websocket_tx_flush_queue();
+    websocket_rx_flush_queue();
+    websocket_rx_request_reset();
     ESP_LOGW(TAG, "Requesting WebSocket close for recovery");
     esp_err_t err = esp_websocket_client_close(ws, pdMS_TO_TICKS(1000));
     if (err != ESP_OK) ESP_LOGW(TAG, "WebSocket close returned: %s", esp_err_to_name(err));
@@ -285,4 +299,9 @@ void websocket_cleanup_finished(esp_websocket_client_handle_t old_client)
         ws_cleanup_pending = false;
         ESP_LOGE(TAG, "WebSocket cleanup queue full; old client not destroyed yet");
     }
+}
+
+void websocket_note_connected(void)
+{
+    ws_connected_since_us = esp_timer_get_time();
 }
