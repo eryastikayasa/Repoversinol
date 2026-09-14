@@ -63,28 +63,34 @@ static void audio_capture_task(void *arg)
         last_us = now_us;
 
         ++frames;
-        if (websocket_is_connected() && !websocket_tx_enqueue_audio(frame, sizeof(frame), websocket_connection_generation))
+        if (websocket_is_connected() &&
+            !websocket_tx_enqueue_audio(frame, sizeof(frame), websocket_connection_generation)) {
             ++drops;
+        }
 
         if (now_us - last_log_us >= 5000000) {
             last_log_us = now_us;
             uint32_t avg_interval = frames > 1 ? (uint32_t)(interval_total_us / (frames - 1)) : 0;
-            ESP_LOGI(TAG, "MIC/TEST profile: frames=%llu interval_avg_us=%lu interval_max_us=%lu drops=%lu heap=%u psram=%u",
-                     (unsigned long long)frames, (unsigned long)avg_interval,
-                     (unsigned long)interval_max_us, (unsigned long)drops,
-                     (unsigned)esp_get_free_heap_size(),
-                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
             uint32_t tx_avg = websocket_tx_frames ?
                 (uint32_t)(websocket_tx_write_total_us / websocket_tx_frames) : 0;
             uint32_t rx_avg = websocket_rx_messages ?
                 (uint32_t)(websocket_rx_process_total_us / websocket_rx_messages) : 0;
-            ESP_LOGI(TAG, "VOICE profile: TX frames=%lu bytes=%llu drops=%lu q_hwm=%u write_avg_us=%lu write_max_us=%lu | RX msg=%lu frag=%lu drops=%lu q_hwm=%u process_avg_us=%lu process_max_us=%lu",
+            ESP_LOGI(TAG, "MIC profile: frames=%llu interval_avg_us=%lu interval_max_us=%lu drops=%lu heap=%u psram=%u",
+                     (unsigned long long)frames, (unsigned long)avg_interval,
+                     (unsigned long)interval_max_us, (unsigned long)drops,
+                     (unsigned)esp_get_free_heap_size(),
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+            ESP_LOGI(TAG, "VOICE profile: gen=%lu TX frames=%lu bytes=%llu drops=%lu q_hwm=%u write_avg_us=%lu write_max_us=%lu slow=%lu | RX msg=%lu frag=%lu drops=%lu q_hwm=%u process_avg_us=%lu process_max_us=%lu | WiFi reconnect=%lu WS reconnect=%lu",
+                     (unsigned long)websocket_connection_generation,
                      (unsigned long)websocket_tx_frames, (unsigned long long)websocket_tx_bytes,
                      (unsigned long)websocket_tx_drops, (unsigned)websocket_tx_high_water,
                      (unsigned long)tx_avg, (unsigned long)websocket_tx_write_max_us,
+                     (unsigned long)websocket_tx_write_slow,
                      (unsigned long)websocket_rx_messages, (unsigned long)websocket_rx_fragments,
                      (unsigned long)websocket_rx_drops, (unsigned)websocket_rx_high_water,
-                     (unsigned long)rx_avg, (unsigned long)websocket_rx_process_max_us);
+                     (unsigned long)rx_avg, (unsigned long)websocket_rx_process_max_us,
+                     (unsigned long)wifi_get_reconnect_count(),
+                     (unsigned long)websocket_get_reconnect_count());
         }
     }
 }
@@ -93,8 +99,17 @@ static void session_supervisor_task(void *arg)
 {
     (void)arg;
     for (;;) {
-        if (wifi_is_ready() && !websocket_is_connected()) websocket_app_start();
-        vTaskDelay(pdMS_TO_TICKS(2000));
+        const bool wifi_ready = wifi_is_ready();
+
+        // Network loss must invalidate the voice session immediately; audio capture keeps its 20 ms cadence.
+        if (!wifi_ready) {
+            websocket_disconnect();
+        } else {
+            (void)websocket_healthcheck();
+            if (!websocket_is_connected()) websocket_app_start();
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(500));
     }
 }
 
@@ -113,13 +128,11 @@ extern "C" void app_main()
 
     audio_hal_init();
     wifi_init_sta();
-    if (!wifi_wait_for_connection(15000)) {
-        ESP_LOGE(TAG, "WiFi failed to obtain IP");
-        while (true) vTaskDelay(pdMS_TO_TICKS(1000));
-    }
-
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
-    websocket_app_start();
+
+    // Do not block boot on a 15 s Wi-Fi timeout. The supervisor owns recovery and will start Gemini after GOT_IP.
+    if (!wifi_wait_for_connection(5000))
+        ESP_LOGW(TAG, "Wi-Fi not ready yet; continuing with offline-safe voice workers");
 
     if (xTaskCreatePinnedToCore(audio_capture_task, "audio_capture", 4096, NULL, 5, NULL, 1) != pdPASS ||
         xTaskCreatePinnedToCore(session_supervisor_task, "session_supervisor", 3072, NULL, 2, NULL, 0) != pdPASS) {
