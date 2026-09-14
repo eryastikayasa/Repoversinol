@@ -199,7 +199,12 @@ bool websocket_tx_init(void)
         if (xTaskCreatePinnedToCore(websocket_cleanup_task, "ws_cleanup", 3072, NULL, 2, &ws_cleanup_task_handle, 0) != pdPASS) return false;
     }
     if (!websocket_tx_task_handle) {
-        if (xTaskCreatePinnedToCore(websocket_tx_task, "ws_tx", 8192, NULL, 5, &websocket_tx_task_handle, 1) != pdPASS) return false;
+        // The esp_websocket_client v1.7.0 send API is synchronous and can block on
+        // TLS/socket backpressure. Keep that blocking path off Core 1, which owns the
+        // 20 ms MIC capture task. Lower priority also prevents TX from starving RX or
+        // playback on Core 0 when transport backpressure occurs. The queue remains
+        // nonblocking and drop-oldest, so realtime freshness is preserved.
+        if (xTaskCreatePinnedToCore(websocket_tx_task, "ws_tx", 8192, NULL, 3, &websocket_tx_task_handle, 0) != pdPASS) return false;
     }
     return true;
 }
