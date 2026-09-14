@@ -17,6 +17,11 @@
 #define WS_RX_POOL_COUNT 4
 #define WS_RX_QUEUE_LENGTH WS_RX_POOL_COUNT
 
+// Realtime audio must not be held by the transport for the 100 ms legacy timeout.
+// 10 ms is intentionally below one 20 ms PCM frame period.
+#define WS_TX_AUDIO_SEND_TIMEOUT_MS 10
+#define WS_TX_AUDIO_SLOW_THRESHOLD_US 30000
+
 typedef enum { WS_TX_COMMAND_SETUP = 1, WS_TX_COMMAND_AUDIO = 2 } ws_tx_command_type_t;
 typedef struct {
     ws_tx_command_type_t type;
@@ -68,9 +73,18 @@ extern uint32_t websocket_tx_frames;
 extern uint64_t websocket_tx_bytes;
 extern uint32_t websocket_tx_drops;
 extern UBaseType_t websocket_tx_high_water;
+extern uint32_t websocket_tx_encode_count;
+extern uint64_t websocket_tx_encode_total_us;
+extern uint32_t websocket_tx_encode_max_us;
+extern uint32_t websocket_tx_json_count;
+extern uint64_t websocket_tx_json_total_us;
+extern uint32_t websocket_tx_json_max_us;
+extern uint32_t websocket_tx_write_count;
 extern uint64_t websocket_tx_write_total_us;
 extern uint32_t websocket_tx_write_max_us;
 extern uint32_t websocket_tx_write_slow;
+extern uint32_t websocket_tx_write_fail;
+extern uint32_t websocket_tx_write_timeout;
 extern uint32_t websocket_rx_messages;
 extern uint32_t websocket_rx_fragments;
 extern uint32_t websocket_rx_drops;
