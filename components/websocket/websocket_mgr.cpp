@@ -131,7 +131,7 @@ static void websocket_tx_task(void *arg)
         if (json_len <= 0 || (size_t)json_len >= sizeof(json_buf)) { ++websocket_tx_drops; continue; }
 
         int64_t start_us = esp_timer_get_time();
-        int sent = esp_websocket_client_send_text(ws, json_buf, json_len, pdMS_TO_TICKS(100));
+        int sent = esp_websocket_client_send_text(ws, json_buf, json_len, pdMS_TO_TICKS(10));
         uint32_t write_us = (uint32_t)(esp_timer_get_time() - start_us);
         websocket_tx_write_total_us += write_us;
         if (write_us > websocket_tx_write_max_us) websocket_tx_write_max_us = write_us;
