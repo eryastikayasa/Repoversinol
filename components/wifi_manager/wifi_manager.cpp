@@ -67,8 +67,9 @@ static void event_handler(void *arg, esp_event_base_t event_base,
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         s_wifi_got_ip = false;
         if (s_wifi_event_group) xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
-        ++s_wifi_reconnect_count;
-        ESP_LOGW(TAG, "Wi-Fi TERPUTUS; reconnect_count=%lu", (unsigned long)s_wifi_reconnect_count);
+        uint32_t count = s_wifi_reconnect_count;
+        s_wifi_reconnect_count = count + 1;
+        ESP_LOGW(TAG, "Wi-Fi TERPUTUS; reconnect_count=%lu", (unsigned long)(count + 1));
         request_wifi_connect("retry");
         return;
     }
