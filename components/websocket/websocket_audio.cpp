@@ -1,263 +1,114 @@
 #include "websocket_internal.h"
-#include "websocket_mgr.h"
 #include "audio_hal.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
-#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/stream_buffer.h"
-#include "freertos/semphr.h"
 #include <stddef.h>
 #include <stdint.h>
-#include <string.h>
 
 static const char *TAG = "WS_AUDIO";
+static constexpr size_t AUDIO_RING_BUFFER_SIZE = 32 * 1024;
+static constexpr size_t AUDIO_PLAYBACK_READ_SIZE = 1024;
+static constexpr size_t AUDIO_PLAYBACK_TRIGGER_SIZE = 256;
+static constexpr uint32_t AUDIO_PLAYBACK_RATE = 24000;
+
 static volatile bool audio_clear_pending = false;
-volatile uint8_t gemini_volume_percent = 100;
-static int16_t volume_buffer[2048];
-
-static StaticSemaphore_t audio_send_mutex_storage;
-static SemaphoreHandle_t audio_send_mutex = NULL;
-
-#define AUDIO_OUTPUT_SAMPLE_RATE       24000U
-#define AUDIO_OUTPUT_BYTES_PER_SEC     (AUDIO_OUTPUT_SAMPLE_RATE * 2U)
-#define AUDIO_RING_BUFFER_SIZE         (128 * 1024)
-#define AUDIO_PLAYBACK_PREBUFFER_SIZE  (48 * 1024)
-#define AUDIO_PLAYBACK_READ_SIZE       2048
-#define AUDIO_PLAYBACK_READ_WAIT_MS    5
-#define AUDIO_PLAYBACK_TRIGGER_SIZE    1024
-#define AUDIO_SEND_CHUNK_SIZE          512
-#define AUDIO_SEND_WAIT_MS             50
-
-static volatile uint32_t audio_turn_generation = 0;
-
-static size_t send_realtime_pcm(const uint8_t *data, size_t len)
-{
-    if (audio_stream == NULL || data == NULL || len == 0) return 0;
-    size_t offset = 0; 
-    while (offset < len) {
-        size_t chunk = len - offset;
-        if (chunk > AUDIO_SEND_CHUNK_SIZE) chunk = AUDIO_SEND_CHUNK_SIZE;
-        chunk &= ~((size_t)1);
-        if (chunk == 0) break;
-
-       TickType_t start = xTaskGetTickCount();
-
-while (xStreamBufferSpacesAvailable(audio_stream) < chunk) {
-    if ((xTaskGetTickCount() - start) > pdMS_TO_TICKS(50)) {
-        break;
-    }
-    vTaskDelay(pdMS_TO_TICKS(1));
-}
-
-if (xStreamBufferSpacesAvailable(audio_stream) < chunk) {
-    // gagal setelah timeout
-    break;
-}
-
-        size_t written = xStreamBufferSend(audio_stream, data + offset, chunk,
-                                           pdMS_TO_TICKS(AUDIO_SEND_WAIT_MS));
-        if (written > 0) {
-            if (written > chunk) written = chunk;
-            written &= ~((size_t)1);
-            offset += written;
-            audio_bytes_queued += written;
-            if (written < chunk) continue;
-            continue;
-        }
-        ESP_LOGW(TAG, "Audio ring penuh: offset=%u/%u pending=%u spaces=%u",
-                 (unsigned)offset, (unsigned)len,
-                 (unsigned)xStreamBufferBytesAvailable(audio_stream),
-                 (unsigned)xStreamBufferSpacesAvailable(audio_stream));
-        continue;
-    }
-    return offset;
-}
-
-void set_gemini_volume(uint8_t percent)
-{
-    (void)percent;
-    gemini_volume_percent = 100;
-    ESP_LOGI(TAG, "Volume Gemini: NONAKTIF (forced 100%%)");
-}
-
-uint8_t get_gemini_volume(void) { return 100; }
+static uint32_t audio_turn_generation = 0;
 
 size_t get_audio_pending_bytes(void)
 {
-    return audio_stream == NULL ? 0 : xStreamBufferBytesAvailable(audio_stream);
+    return audio_stream ? xStreamBufferBytesAvailable(audio_stream) : 0;
 }
 
 void check_audio_playback_complete(void)
 {
-    if (!audio_turn_complete_pending || audio_stream == NULL) return;
+    if (!audio_turn_complete_pending || !audio_stream) return;
     if (xStreamBufferBytesAvailable(audio_stream) != 0) return;
     audio_turn_complete_pending = false;
     audio_turn_active = false;
-    const uint64_t accounted = audio_bytes_queued + audio_bytes_dropped;
-    const int64_t balance = (int64_t)audio_bytes_received - (int64_t)accounted;
-    ESP_LOGI(TAG,
-             "AUDIO PLAYBACK COMPLETE: received=%llu queued=%llu played=%llu pending=0 dropped=%llu balance=%lld",
+    ESP_LOGI(TAG, "Playback complete: received=%llu played=%llu dropped=%llu",
              (unsigned long long)audio_bytes_received,
-             (unsigned long long)audio_bytes_queued,
              (unsigned long long)audio_bytes_played,
-             (unsigned long long)audio_bytes_dropped,
-             (long long)balance);
+             (unsigned long long)audio_bytes_dropped);
 }
 
 static void audio_playback_task(void *arg)
 {
     (void)arg;
-    static uint8_t playback_buffer[AUDIO_PLAYBACK_READ_SIZE];
-    bool playback_started = false;
-    bool underrun_reported = false;
-    uint32_t playback_generation = 0;
-    int64_t last_stats_us = 0;
-    ESP_LOGI(TAG, "Audio playback task: 24kHz PCM16 mono, ring=%u, prebuffer=%u, core=%d priority=3",
-             (unsigned)AUDIO_RING_BUFFER_SIZE,
-             (unsigned)AUDIO_PLAYBACK_PREBUFFER_SIZE,
-             xPortGetCoreID());
+    static uint8_t buffer[AUDIO_PLAYBACK_READ_SIZE];
+    uint32_t generation = 0;
+    bool started = false;
+    uint32_t underruns = 0;
+
+    ESP_LOGI(TAG, "Playback worker: core=%d priority=%d ring=%u bytes",
+             xPortGetCoreID(), uxTaskPriorityGet(NULL), (unsigned)AUDIO_RING_BUFFER_SIZE);
 
     for (;;) {
         if (audio_clear_pending) {
             audio_clear_pending = false;
-            /* Do not let the playback task wait forever on the producer mutex.
-             * A permanent wait here can starve the idle task and trigger WDT. */
-            if (audio_send_mutex != NULL) {
-                if (xSemaphoreTake(audio_send_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                    if (audio_stream != NULL) xStreamBufferReset(audio_stream);
-                    xSemaphoreGive(audio_send_mutex);
-                } else {
-                    ESP_LOGW(TAG, "Playback clear mutex busy - clear ditunda");
-                    audio_clear_pending = true;
-                    vTaskDelay(pdMS_TO_TICKS(2));
-                    continue;
-                }
-            } else if (audio_stream != NULL) {
-                xStreamBufferReset(audio_stream);
-            }
+            if (audio_stream) xStreamBufferReset(audio_stream);
+            started = false;
             audio_turn_complete_pending = false;
             audio_turn_active = false;
-            playback_started = false;
-            underrun_reported = false;
-            playback_generation = audio_turn_generation;
+            generation = audio_turn_generation;
         }
 
-        uint32_t current_generation = audio_turn_generation;
-        if (current_generation != playback_generation) {
-            playback_generation = current_generation;
-            playback_started = false;
-            underrun_reported = false;
-        }
-
-        if (audio_stream == NULL) {
-            vTaskDelay(pdMS_TO_TICKS(100));
+        if (!audio_stream) {
+            vTaskDelay(pdMS_TO_TICKS(20));
             continue;
+        }
+
+        if (generation != audio_turn_generation) {
+            generation = audio_turn_generation;
+            started = false;
         }
 
         size_t pending = xStreamBufferBytesAvailable(audio_stream);
-
-        /* 16 KiB = 341 ms at 24 kHz PCM16 mono. Prime before I2S starts. */
-        if (!playback_started && pending < AUDIO_PLAYBACK_PREBUFFER_SIZE &&
-            audio_turn_active && !audio_turn_complete_pending) {
-            vTaskDelay(pdMS_TO_TICKS(5));
+        if (!started && audio_turn_active && pending < AUDIO_PLAYBACK_TRIGGER_SIZE) {
+            vTaskDelay(pdMS_TO_TICKS(2));
             continue;
         }
 
-        if (playback_started && pending == 0 && audio_turn_active &&
-            !audio_turn_complete_pending) {
-            if (!underrun_reported) {
-                ESP_LOGW(TAG, "AUDIO PLAYBACK UNDERRUN: PCM buffer kosong di tengah turn");
-                underrun_reported = true;
+        size_t got = xStreamBufferReceive(audio_stream, buffer, sizeof(buffer), pdMS_TO_TICKS(10));
+        if (got == 0) {
+            if (started && audio_turn_active && !audio_turn_complete_pending) {
+                ++underruns;
+                if ((underruns % 10U) == 1U)
+                    ESP_LOGW(TAG, "Playback underrun count=%lu", (unsigned long)underruns);
             }
-            vTaskDelay(pdMS_TO_TICKS(AUDIO_PLAYBACK_READ_WAIT_MS));
-            continue;
-        }
-
-        size_t received = xStreamBufferReceive(audio_stream, playback_buffer,
-                                               sizeof(playback_buffer),
-                                               pdMS_TO_TICKS(AUDIO_PLAYBACK_READ_WAIT_MS));
-        if (received == 0) {
             check_audio_playback_complete();
-            /* Explicit scheduler yield even on the empty-buffer path. */
-            vTaskDelay(1);
-            continue;
-        }
-        received &= ~((size_t)1);
-        if (received == 0) {
-            vTaskDelay(1);
             continue;
         }
 
-        playback_started = true;
-        underrun_reported = false;
-        audio_write_speaker(playback_buffer, received);
-        audio_write_calls++;
-        audio_bytes_played += received;
+        started = true;
+        audio_write_speaker(buffer, got);
+        ++audio_write_calls;
+        audio_bytes_played += got;
         check_audio_playback_complete();
-
-        int64_t now_us = esp_timer_get_time();
-        if (last_stats_us == 0 || now_us - last_stats_us >= 1000000) {
-            last_stats_us = now_us;
-            ESP_LOGI(TAG,
-                     "AUDIO FLOW: pending=%u/%u received=%llu queued=%llu played=%llu dropped=%llu",
-                     (unsigned)xStreamBufferBytesAvailable(audio_stream),
-                     (unsigned)AUDIO_RING_BUFFER_SIZE,
-                     (unsigned long long)audio_bytes_received,
-                     (unsigned long long)audio_bytes_queued,
-                     (unsigned long long)audio_bytes_played,
-                     (unsigned long long)audio_bytes_dropped);
-        }
-
-        if (!audio_turn_active && xStreamBufferBytesAvailable(audio_stream) == 0) {
-            playback_started = false;
-            underrun_reported = false;
-        }
-
-        /* Mandatory yield after every playback iteration. */
-        vTaskDelay(1);
     }
 }
 
 bool start_audio_playback(void)
 {
-    if (audio_stream != NULL) return true;
-    if (audio_send_mutex == NULL) {
-        audio_send_mutex = xSemaphoreCreateMutexStatic(&audio_send_mutex_storage);
-        if (audio_send_mutex == NULL) {
-            ESP_LOGE(TAG, "Gagal membuat audio send mutex");
-            return false;
-        }
-    }
-    audio_stream = xStreamBufferCreate(AUDIO_RING_BUFFER_SIZE,
-                                       AUDIO_PLAYBACK_TRIGGER_SIZE);
-    if (audio_stream == NULL) {
-        ESP_LOGE(TAG, "Gagal membuat audio ring buffer %u byte free_internal=%u largest=%u",
-                 (unsigned)AUDIO_RING_BUFFER_SIZE,
+    if (audio_stream) return true;
+    audio_stream = xStreamBufferCreate(AUDIO_RING_BUFFER_SIZE, AUDIO_PLAYBACK_TRIGGER_SIZE);
+    if (!audio_stream) {
+        ESP_LOGE(TAG, "Failed to create playback buffer: free=%u largest=%u",
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
         return false;
     }
-    /* v7.1.3 diagnostic: lower playback priority and keep it on CPU0 as in
-     * the failing v7.1.2 trace. This isolates priority/idle starvation first
-     * without changing I2S, DMA, ring size, or WebSocket behavior. */
-    BaseType_t result = xTaskCreatePinnedToCore(audio_playback_task, "audio_playback",
-                                                4096, NULL, 6,
-                                                &audio_playback_task_handle, 0);
-    if (result != pdPASS) {
-        ESP_LOGE(TAG, "Gagal membuat audio_task/playback task: free_internal=%u largest=%u",
-                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+
+    if (xTaskCreatePinnedToCore(audio_playback_task, "audio_playback", 4096, NULL, 4,
+                                &audio_playback_task_handle, 0) != pdPASS) {
         vStreamBufferDelete(audio_stream);
         audio_stream = NULL;
-        audio_playback_task_handle = NULL;
         return false;
     }
-    ESP_LOGI(TAG, "Audio ring buffer siap: %u byte, prebuffer=%u, target=%u B/s, playback core=0 priority=6",
-             (unsigned)AUDIO_RING_BUFFER_SIZE,
-             (unsigned)AUDIO_PLAYBACK_PREBUFFER_SIZE,
-             (unsigned)AUDIO_OUTPUT_BYTES_PER_SEC);
+    ESP_LOGI(TAG, "Playback ready: %u-byte bounded buffer, %u Hz PCM16",
+             (unsigned)AUDIO_RING_BUFFER_SIZE, (unsigned)AUDIO_PLAYBACK_RATE);
     return true;
 }
 
@@ -265,14 +116,8 @@ void request_audio_buffer_clear(void) { audio_clear_pending = true; }
 
 void clear_audio_buffer(void)
 {
+    if (audio_stream) xStreamBufferReset(audio_stream);
     audio_clear_pending = false;
-    if (audio_send_mutex != NULL) {
-        xSemaphoreTake(audio_send_mutex, portMAX_DELAY);
-        if (audio_stream != NULL) xStreamBufferReset(audio_stream);
-        xSemaphoreGive(audio_send_mutex);
-    } else if (audio_stream != NULL) {
-        xStreamBufferReset(audio_stream);
-    }
     audio_turn_complete_pending = false;
     audio_turn_active = false;
 }
@@ -292,70 +137,34 @@ void reset_audio_turn_stats(void)
 void begin_audio_turn(void)
 {
     if (audio_turn_active) return;
+    ++audio_turn_generation;
+    if (audio_turn_generation == 0) audio_turn_generation = 1;
+    audio_turn_active = true;
+    audio_turn_complete_pending = false;
     audio_chunks_received = 0;
     audio_bytes_received = 0;
     audio_bytes_queued = 0;
-    audio_write_calls = 0;
     audio_bytes_played = 0;
     audio_bytes_dropped = 0;
-
-    if (audio_stream != NULL) {
-        size_t stale = xStreamBufferBytesAvailable(audio_stream);
-        if (stale > 0) {
-            xStreamBufferReset(audio_stream);
-            audio_bytes_dropped = stale;
-            ESP_LOGW(TAG, "Audio stale PCM dibuang saat turn baru: %u byte",
-                     (unsigned)stale);
-        }
-    }
-
-    uint32_t next_generation = audio_turn_generation + 1U;
-    if (next_generation == 0U) next_generation = 1U;
-    audio_turn_generation = next_generation;
-    audio_turn_active = true;
-    audio_turn_complete_pending = false;
 }
 
 bool queue_audio_pcm(const uint8_t *pcm, size_t len)
 {
-    if (pcm == NULL || len == 0) return false;
+    if (!pcm || !len) return false;
     len &= ~((size_t)1);
-    if (len == 0) return false;
-    if (audio_stream == NULL && !start_audio_playback()) return false;
-    if (audio_stream == NULL) return false;
-    if (audio_send_mutex == NULL) {
-        ESP_LOGE(TAG, "Audio send mutex belum siap");
-        return false;
-    }
-    if (xSemaphoreTake(audio_send_mutex, portMAX_DELAY) != pdTRUE) {
-        ESP_LOGE(TAG, "Gagal mengambil audio send mutex");
-        return false;
-    }
+    if (!len) return false;
+    if (!audio_stream && !start_audio_playback()) return false;
+    if (!audio_stream) return false;
 
     begin_audio_turn();
-
-    uint64_t queued_before = audio_bytes_queued;
-    uint64_t dropped_before = audio_bytes_dropped;
-
-    /* Volume command feature is disabled for the stability test.
-     * Keep the incoming Gemini PCM untouched so the audio path is exactly
-     * the proven PCM16 -> ring buffer -> I2S path. */
-    (void)send_realtime_pcm(pcm, len);
-
-    const uint64_t queued_delta = audio_bytes_queued - queued_before;
-    const uint64_t dropped_delta = audio_bytes_dropped - dropped_before;
-    const uint64_t accounted_delta = queued_delta + dropped_delta;
-    if (accounted_delta < (uint64_t)len) {
-        const uint64_t missing = (uint64_t)len - accounted_delta;
-        audio_bytes_dropped += missing;
-        ESP_LOGW(TAG, "Audio accounting guard: %llu byte -> dropped",
-                 (unsigned long long)missing);
-    } else if (accounted_delta > (uint64_t)len) {
-        ESP_LOGW(TAG,
-                 "Audio accounting anomaly: accounted_delta=%llu len=%u",
-                 (unsigned long long)accounted_delta, (unsigned)len);
+    size_t sent = xStreamBufferSend(audio_stream, pcm, len, 0);
+    if (sent > 0) audio_bytes_queued += sent;
+    if (sent < len) {
+        audio_bytes_dropped += len - sent;
+        ESP_LOGW(TAG, "RX playback buffer full: dropped=%u pending=%u/%u",
+                 (unsigned)(len - sent),
+                 (unsigned)xStreamBufferBytesAvailable(audio_stream),
+                 (unsigned)AUDIO_RING_BUFFER_SIZE);
     }
-
-    xSemaphoreGive(audio_send_mutex);
-    return queued_delta == (uint64_t)len;
+    return sent == len;
 }

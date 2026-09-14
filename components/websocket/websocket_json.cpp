@@ -33,15 +33,13 @@ bool build_gemini_setup(char **output, size_t *output_len)
     *output_len = 0;
 
     cJSON *root = cJSON_CreateObject();
-    cJSON *setup = root ? cJSON_AddObjectToObject(root, "setup") : NULL;
-    cJSON *generation = setup ? cJSON_AddObjectToObject(setup, "generationConfig") : NULL;
-    cJSON *modalities = generation ? cJSON_AddArrayToObject(generation, "responseModalities") : NULL;
-    if (!root || !setup || !generation || !modalities) {
-        cJSON_Delete(root);
-        return false;
-    }
-
+    if (!root) return false;
+    cJSON *setup = cJSON_AddObjectToObject(root, "setup");
+    cJSON *generation = cJSON_AddObjectToObject(setup, "generationConfig");
+    cJSON *modalities = cJSON_AddArrayToObject(generation, "responseModalities");
+    if (!setup || !generation || !modalities) { cJSON_Delete(root); return false; }
     cJSON_AddItemToArray(modalities, cJSON_CreateString("AUDIO"));
+
     cJSON *speech = cJSON_AddObjectToObject(generation, "speechConfig");
     cJSON *voice = cJSON_AddObjectToObject(speech, "voiceConfig");
     cJSON *prebuilt = cJSON_AddObjectToObject(voice, "prebuiltVoiceConfig");
@@ -55,17 +53,21 @@ bool build_gemini_setup(char **output, size_t *output_len)
     cJSON *aad = cJSON_AddObjectToObject(realtime, "automaticActivityDetection");
     cJSON_AddBoolToObject(aad, "disabled", false);
 
-    cJSON_AddObjectToObject(setup, "sessionResumption");
-    cJSON_AddObjectToObject(setup, "contextWindowCompression");
+    cJSON *resume = cJSON_AddObjectToObject(setup, "sessionResumption");
     if (session_resumable && session_handle[0])
-        cJSON_AddStringToObject(cJSON_GetObjectItem(setup, "sessionResumption"), "handle", session_handle);
+        cJSON_AddStringToObject(resume, "handle", session_handle);
+
+    cJSON *compression = cJSON_AddObjectToObject(setup, "contextWindowCompression");
+    cJSON_AddNumberToObject(compression, "triggerTokens", 25000);
+    cJSON *window = cJSON_AddObjectToObject(compression, "slidingWindow");
+    cJSON_AddNumberToObject(window, "targetTokens", 12500);
 
     char *json = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
     if (!json) return false;
     *output = json;
     *output_len = strlen(json);
-    ESP_LOGI(TAG, "Gemini setup ready: AUDIO/16k input, session resumption, context compression");
+    ESP_LOGI(TAG, "Gemini setup: AUDIO + AAD + resumption + 25k/12.5k context compression");
     return true;
 }
 
@@ -73,9 +75,9 @@ static bool decode_audio(cJSON *inline_data)
 {
     cJSON *audio = cJSON_GetObjectItem(inline_data, "data");
     if (!cJSON_IsString(audio) || !audio->valuestring) return true;
-
     size_t b64_len = strlen(audio->valuestring);
-    if (b64_len == 0) return true;
+    if (!b64_len) return true;
+
     size_t pcm_len = 0;
     int ret = mbedtls_base64_decode(NULL, 0, &pcm_len,
                                     (const unsigned char *)audio->valuestring, b64_len);
@@ -103,17 +105,16 @@ void process_gemini_message(const char *json, size_t len)
         return;
     }
 
-    cJSON *setup_complete = cJSON_GetObjectItem(root, "setupComplete");
-    if (cJSON_IsObject(setup_complete)) {
-        setup_complete = setup_complete;
+    cJSON *setup_obj = cJSON_GetObjectItem(root, "setupComplete");
+    if (cJSON_IsObject(setup_obj)) {
         ::setup_complete = true;
         ESP_LOGI(TAG, "Gemini SETUP COMPLETE");
     }
 
-    cJSON *resume = cJSON_GetObjectItem(root, "sessionResumptionUpdate");
-    if (cJSON_IsObject(resume)) {
-        cJSON *handle = cJSON_GetObjectItem(resume, "newHandle");
-        cJSON *resumable = cJSON_GetObjectItem(resume, "resumable");
+    cJSON *resume_update = cJSON_GetObjectItem(root, "sessionResumptionUpdate");
+    if (cJSON_IsObject(resume_update)) {
+        cJSON *handle = cJSON_GetObjectItem(resume_update, "newHandle");
+        cJSON *resumable = cJSON_GetObjectItem(resume_update, "resumable");
         if (cJSON_IsTrue(resumable) && cJSON_IsString(handle))
             store_session_handle(handle->valuestring);
     }
@@ -141,7 +142,6 @@ void process_gemini_message(const char *json, size_t len)
             clear_audio_buffer();
             audio_turn_complete_pending = false;
             audio_turn_active = false;
-            ESP_LOGI(TAG, "Gemini response interrupted");
         }
     }
 

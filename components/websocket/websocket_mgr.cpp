@@ -1,16 +1,13 @@
-#include "websocket_mgr.h"
 #include "websocket_internal.h"
 #include "wifi_manager.h"
 #include "esp_log.h"
 #include "esp_websocket_client.h"
 #include "esp_crt_bundle.h"
 #include "mbedtls/base64.h"
+#include "esp_timer.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "freertos/queue.h"
 
 static const char *TAG = "WS_MGR";
 esp_websocket_client_handle_t client = NULL;
@@ -31,19 +28,33 @@ uint64_t audio_bytes_queued = 0;
 uint32_t audio_write_calls = 0;
 uint64_t audio_bytes_played = 0;
 uint64_t audio_bytes_dropped = 0;
+
 static volatile bool ws_started = false;
 QueueHandle_t websocket_tx_queue = NULL;
 TaskHandle_t websocket_tx_task_handle = NULL;
 QueueHandle_t websocket_rx_queue = NULL;
+QueueHandle_t websocket_rx_free_queue = NULL;
 TaskHandle_t websocket_rx_task_handle = NULL;
+
+uint32_t websocket_tx_frames = 0;
+uint64_t websocket_tx_bytes = 0;
+uint32_t websocket_tx_drops = 0;
+UBaseType_t websocket_tx_high_water = 0;
+uint64_t websocket_tx_write_total_us = 0;
+uint32_t websocket_tx_write_max_us = 0;
+
+uint32_t websocket_rx_messages = 0;
+uint32_t websocket_rx_fragments = 0;
+uint32_t websocket_rx_drops = 0;
+UBaseType_t websocket_rx_high_water = 0;
+uint64_t websocket_rx_process_total_us = 0;
+uint32_t websocket_rx_process_max_us = 0;
 
 void websocket_tx_flush_queue(void)
 {
     if (!websocket_tx_queue) return;
     ws_tx_command_t stale = {};
-    while (xQueueReceive(websocket_tx_queue, &stale, 0) == pdTRUE) {
-        if (stale.data) free(stale.data);
-    }
+    while (xQueueReceive(websocket_tx_queue, &stale, 0) == pdTRUE) {}
 }
 
 static void websocket_tx_fail(void)
@@ -59,77 +70,62 @@ static void websocket_tx_task(void *arg)
 {
     (void)arg;
     ws_tx_command_t cmd = {};
+    static char b64_buf[1024];
+    static char json_buf[1200];
+
+    ESP_LOGI(TAG, "TX worker: core=%d priority=%d queue=%d frame=%d bytes/20ms",
+             xPortGetCoreID(), uxTaskPriorityGet(NULL), WS_TX_QUEUE_LENGTH, WS_TX_AUDIO_SIZE);
+
     for (;;) {
         if (xQueueReceive(websocket_tx_queue, &cmd, portMAX_DELAY) != pdTRUE) continue;
-        uint8_t *audio_data = cmd.data;
-        cmd.data = NULL;
-        if (cmd.generation != websocket_connection_generation || !is_connected || websocket_tx_error || !client) {
-            free(audio_data);
-            continue;
-        }
+        if (cmd.generation != websocket_connection_generation || !is_connected || websocket_tx_error || !client) continue;
+
         esp_websocket_client_handle_t ws = client;
-        if (!esp_websocket_client_is_connected(ws)) {
-            free(audio_data);
-            continue;
-        }
+        if (!esp_websocket_client_is_connected(ws)) continue;
 
         if (cmd.type == WS_TX_COMMAND_SETUP) {
             char *setup_json = NULL;
             size_t setup_len = 0;
-            if (!build_gemini_setup(&setup_json, &setup_len)) {
-                free(audio_data);
-                continue;
-            }
-            if (cmd.generation != websocket_connection_generation || !is_connected || client != ws) {
-                free(setup_json);
-                free(audio_data);
-                continue;
-            }
-            int sent = esp_websocket_client_send_text(ws, setup_json, (int)setup_len, pdMS_TO_TICKS(5000));
+            if (!build_gemini_setup(&setup_json, &setup_len)) continue;
+            int sent = esp_websocket_client_send_text(ws, setup_json, (int)setup_len, 5000);
             if (sent != (int)setup_len) websocket_tx_fail();
             else ESP_LOGI(TAG, "Gemini setup sent: %d bytes", sent);
             free(setup_json);
-            free(audio_data);
             continue;
         }
 
-        if (cmd.type == WS_TX_COMMAND_AUDIO) {
-            static char b64_buf[1024];
-            static char json_buf[1200];
-            if (!audio_data || cmd.len != WS_TX_AUDIO_SIZE) {
-                free(audio_data);
-                continue;
-            }
+        if (cmd.type != WS_TX_COMMAND_AUDIO || cmd.len != WS_TX_AUDIO_SIZE) continue;
 
-            size_t encoded_len = 0;
-            int ret = mbedtls_base64_encode((unsigned char *)b64_buf, sizeof(b64_buf) - 1,
-                                            &encoded_len, audio_data, cmd.len);
-            if (ret != 0) {
-                free(audio_data);
-                continue;
-            }
-            b64_buf[encoded_len] = '\0';
-            int json_len = snprintf(json_buf, sizeof(json_buf),
-                "{\"realtimeInput\":{\"audio\":{\"mimeType\":\"audio/pcm;rate=16000\",\"data\":\"%s\"}}}",
-                b64_buf);
-            if (json_len <= 0 || (size_t)json_len >= sizeof(json_buf)) {
-                free(audio_data);
-                continue;
-            }
-
-            int sent = esp_websocket_client_send_text(ws, json_buf, json_len, pdMS_TO_TICKS(100));
-            if (sent == json_len) {
-                ++websocket_tx_frames;
-                websocket_tx_bytes += cmd.len;
-            } else {
-                ++websocket_tx_drops;
-                ESP_LOGW(TAG, "TX write failed: sent=%d expected=%d", sent, json_len);
-            }
-            free(audio_data);
+        size_t encoded_len = 0;
+        int ret = mbedtls_base64_encode((unsigned char *)b64_buf, sizeof(b64_buf) - 1,
+                                        &encoded_len, cmd.data, cmd.len);
+        if (ret != 0) {
+            ++websocket_tx_drops;
+            continue;
+        }
+        b64_buf[encoded_len] = '\0';
+        int json_len = snprintf(json_buf, sizeof(json_buf),
+            "{\"realtimeInput\":{\"audio\":{\"mimeType\":\"audio/pcm;rate=16000\",\"data\":\"%s\"}}}",
+            b64_buf);
+        if (json_len <= 0 || (size_t)json_len >= sizeof(json_buf)) {
+            ++websocket_tx_drops;
             continue;
         }
 
-        free(audio_data);
+        int64_t start_us = esp_timer_get_time();
+        int sent = esp_websocket_client_send_text(ws, json_buf, json_len, 100);
+        uint32_t write_us = (uint32_t)(esp_timer_get_time() - start_us);
+        websocket_tx_write_total_us += write_us;
+        if (write_us > websocket_tx_write_max_us) websocket_tx_write_max_us = write_us;
+
+        if (sent == json_len) {
+            ++websocket_tx_frames;
+            websocket_tx_bytes += cmd.len;
+        } else {
+            ++websocket_tx_drops;
+            ESP_LOGW(TAG, "TX write fail: sent=%d expected=%d write_us=%u",
+                     sent, json_len, (unsigned)write_us);
+        }
     }
 }
 
@@ -151,18 +147,13 @@ bool websocket_tx_enqueue_audio(const uint8_t *data, size_t len, uint32_t genera
     if (!data || len != WS_TX_AUDIO_SIZE || !websocket_tx_queue || !is_connected ||
         !setup_complete || websocket_tx_error || generation != websocket_connection_generation) return false;
 
-    uint8_t *copy = (uint8_t *)malloc(len);
-    if (!copy) return false;
-    memcpy(copy, data, len);
-
     ws_tx_command_t cmd = {};
     cmd.type = WS_TX_COMMAND_AUDIO;
     cmd.generation = generation;
     cmd.len = (uint16_t)len;
-    cmd.data = copy;
+    memcpy(cmd.data, data, WS_TX_AUDIO_SIZE);
     if (xQueueSend(websocket_tx_queue, &cmd, 0) != pdTRUE) {
         ++websocket_tx_drops;
-        free(copy);
         return false;
     }
     UBaseType_t waiting = uxQueueMessagesWaiting(websocket_tx_queue);
@@ -177,7 +168,7 @@ void websocket_schedule_setup(uint32_t generation)
     cmd.type = WS_TX_COMMAND_SETUP;
     cmd.generation = generation;
     if (xQueueSend(websocket_tx_queue, &cmd, pdMS_TO_TICKS(1000)) != pdTRUE)
-        ESP_LOGW(TAG, "Setup command queue full");
+        ESP_LOGW(TAG, "SETUP queue full");
 }
 
 void websocket_app_start(void)
