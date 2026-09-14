@@ -17,12 +17,6 @@ idf_component_register(
         esp_event
         cjson
         mbedtls
-        display
         audio_hal
         wifi_manager
-)
-
-# V7.0.12: increase only the ESP WebSocket client's internal task stack.
-target_link_libraries(${COMPONENT_LIB} INTERFACE
-    "-Wl,--wrap=esp_websocket_client_init"
 )

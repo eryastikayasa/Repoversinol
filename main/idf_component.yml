@@ -3,5 +3,3 @@ dependencies:
     version: "^1.7.0"
   espressif/cjson:
     version: "^1.7.0"
-  espressif/esp-sr:
-    version: "2.4.6"
