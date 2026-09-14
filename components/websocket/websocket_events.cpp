@@ -75,14 +75,14 @@ void websocket_event_handler(void *handler_args, esp_event_base_t base,
             websocket_rx_request_reset();
             break;
 
-        case WEBSOCKET_EVENT_FINISH:
+        case WEBSOCKET_EVENT_FINISH: {
             ESP_LOGI(TAG, "WebSocket FINISH");
-            if (client) {
-                esp_websocket_client_destroy(client);
-                client = NULL;
-            }
+            esp_websocket_client_handle_t old_client = client;
+            client = NULL;
             websocket_reset_started();
+            if (old_client) websocket_cleanup_finished(old_client);
             break;
+        }
 
         default:
             break;
