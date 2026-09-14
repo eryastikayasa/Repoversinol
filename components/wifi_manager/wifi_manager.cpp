@@ -34,8 +34,6 @@ static void request_wifi_connect(const char *reason)
     }
 
     s_last_connect_attempt_us = now;
-    if (reason && strcmp(reason, "retry") == 0) ++s_wifi_reconnect_count;
-
     esp_err_t err = esp_wifi_connect();
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "esp_wifi_connect gagal (%s): %s", reason ? reason : "unknown",
@@ -148,7 +146,7 @@ bool wifi_wait_for_connection(uint32_t timeout_ms)
         ESP_LOGI(TAG, "Wi-Fi READY - GOT_IP diterima");
         return true;
     }
-    ESP_LOGE(TAG, "Timeout menunggu WIFI GOT_IP");
+    ESP_LOGW(TAG, "Wi-Fi belum READY dalam timeout; recovery tetap berjalan di event handler");
     return false;
 }
 
