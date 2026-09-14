@@ -30,6 +30,11 @@ uint64_t audio_bytes_played = 0;
 uint64_t audio_bytes_dropped = 0;
 
 static volatile bool ws_started = false;
+static volatile bool ws_close_requested = false;
+static volatile bool ws_cleanup_pending = false;
+static QueueHandle_t ws_cleanup_queue = NULL;
+static TaskHandle_t ws_cleanup_task_handle = NULL;
+
 QueueHandle_t websocket_tx_queue = NULL;
 TaskHandle_t websocket_tx_task_handle = NULL;
 QueueHandle_t websocket_rx_queue = NULL;
@@ -42,6 +47,7 @@ uint32_t websocket_tx_drops = 0;
 UBaseType_t websocket_tx_high_water = 0;
 uint64_t websocket_tx_write_total_us = 0;
 uint32_t websocket_tx_write_max_us = 0;
+uint32_t websocket_tx_write_slow = 0;
 
 uint32_t websocket_rx_messages = 0;
 uint32_t websocket_rx_fragments = 0;
@@ -49,6 +55,20 @@ uint32_t websocket_rx_drops = 0;
 UBaseType_t websocket_rx_high_water = 0;
 uint64_t websocket_rx_process_total_us = 0;
 uint32_t websocket_rx_process_max_us = 0;
+
+static void websocket_cleanup_task(void *arg)
+{
+    (void)arg;
+    esp_websocket_client_handle_t old_client = NULL;
+    for (;;) {
+        if (xQueueReceive(ws_cleanup_queue, &old_client, portMAX_DELAY) == pdTRUE && old_client) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            esp_websocket_client_destroy(old_client);
+            ws_cleanup_pending = false;
+            ESP_LOGI(TAG, "Old WebSocket client destroyed outside event callback");
+        }
+    }
+}
 
 void websocket_tx_flush_queue(void)
 {
@@ -59,11 +79,14 @@ void websocket_tx_flush_queue(void)
 
 static void websocket_tx_fail(void)
 {
+    if (websocket_tx_error) return;
     websocket_tx_error = true;
     is_connected = false;
     setup_complete = false;
     ++websocket_connection_generation;
     websocket_tx_flush_queue();
+    ESP_LOGW(TAG, "TX transport unhealthy; invalidating generation and requesting reconnect");
+    websocket_disconnect();
 }
 
 static void websocket_tx_task(void *arg)
@@ -72,6 +95,7 @@ static void websocket_tx_task(void *arg)
     ws_tx_command_t cmd = {};
     static char b64_buf[1024];
     static char json_buf[1200];
+    uint32_t consecutive_slow = 0;
 
     ESP_LOGI(TAG, "TX worker: core=%d priority=%d queue=%d frame=%d bytes/20ms",
              xPortGetCoreID(), uxTaskPriorityGet(NULL), WS_TX_QUEUE_LENGTH, WS_TX_AUDIO_SIZE);
@@ -86,7 +110,7 @@ static void websocket_tx_task(void *arg)
             char *setup_json = NULL;
             size_t setup_len = 0;
             if (!build_gemini_setup(&setup_json, &setup_len)) continue;
-            int sent = esp_websocket_client_send_text(ws, setup_json, (int)setup_len, 5000);
+            int sent = esp_websocket_client_send_text(ws, setup_json, (int)setup_len, pdMS_TO_TICKS(1000));
             if (sent != (int)setup_len) websocket_tx_fail();
             else ESP_LOGI(TAG, "Gemini setup sent: %d bytes", sent);
             free(setup_json);
@@ -105,16 +129,29 @@ static void websocket_tx_task(void *arg)
         if (json_len <= 0 || (size_t)json_len >= sizeof(json_buf)) { ++websocket_tx_drops; continue; }
 
         int64_t start_us = esp_timer_get_time();
-        int sent = esp_websocket_client_send_text(ws, json_buf, json_len, 100);
+        int sent = esp_websocket_client_send_text(ws, json_buf, json_len, pdMS_TO_TICKS(100));
         uint32_t write_us = (uint32_t)(esp_timer_get_time() - start_us);
         websocket_tx_write_total_us += write_us;
         if (write_us > websocket_tx_write_max_us) websocket_tx_write_max_us = write_us;
+
         if (sent == json_len) {
             ++websocket_tx_frames;
             websocket_tx_bytes += cmd.len;
+            if (write_us >= 80000) {
+                ++websocket_tx_write_slow;
+                if (++consecutive_slow >= 3) {
+                    ESP_LOGW(TAG, "TX send repeatedly slow: write_us=%u count=%lu", (unsigned)write_us, (unsigned long)consecutive_slow);
+                    websocket_tx_fail();
+                    consecutive_slow = 0;
+                }
+            } else {
+                consecutive_slow = 0;
+            }
         } else {
             ++websocket_tx_drops;
             ESP_LOGW(TAG, "TX write fail: sent=%d expected=%d write_us=%u", sent, json_len, (unsigned)write_us);
+            websocket_tx_fail();
+            consecutive_slow = 0;
         }
     }
 }
@@ -124,6 +161,14 @@ bool websocket_tx_init(void)
     if (!websocket_tx_queue) {
         websocket_tx_queue = xQueueCreate(WS_TX_QUEUE_LENGTH, sizeof(ws_tx_command_t));
         if (!websocket_tx_queue) return false;
+    }
+    if (!ws_cleanup_queue) {
+        ws_cleanup_queue = xQueueCreate(1, sizeof(esp_websocket_client_handle_t));
+        if (!ws_cleanup_queue) return false;
+    }
+    if (!ws_cleanup_task_handle) {
+        if (xTaskCreatePinnedToCore(websocket_cleanup_task, "ws_cleanup", 3072, NULL, 2,
+                                    &ws_cleanup_task_handle, 0) != pdPASS) return false;
     }
     if (!websocket_tx_task_handle) {
         if (xTaskCreatePinnedToCore(websocket_tx_task, "ws_tx", 8192, NULL, 5,
@@ -141,7 +186,18 @@ bool websocket_tx_enqueue_audio(const uint8_t *data, size_t len, uint32_t genera
     cmd.generation = generation;
     cmd.len = (uint16_t)len;
     memcpy(cmd.data, data, WS_TX_AUDIO_SIZE);
-    if (xQueueSend(websocket_tx_queue, &cmd, 0) != pdTRUE) { ++websocket_tx_drops; return false; }
+
+    if (xQueueSend(websocket_tx_queue, &cmd, 0) != pdTRUE) {
+        ws_tx_command_t oldest = {};
+        if (xQueueReceive(websocket_tx_queue, &oldest, 0) == pdTRUE &&
+            xQueueSend(websocket_tx_queue, &cmd, 0) == pdTRUE) {
+            ++websocket_tx_drops;
+            ESP_LOGD(TAG, "TX queue full: dropped oldest PCM frame");
+        } else {
+            ++websocket_tx_drops;
+            return false;
+        }
+    }
     UBaseType_t waiting = uxQueueMessagesWaiting(websocket_tx_queue);
     if (waiting > websocket_tx_high_water) websocket_tx_high_water = waiting;
     return true;
@@ -153,13 +209,13 @@ void websocket_schedule_setup(uint32_t generation)
     ws_tx_command_t cmd = {};
     cmd.type = WS_TX_COMMAND_SETUP;
     cmd.generation = generation;
-    if (xQueueSend(websocket_tx_queue, &cmd, pdMS_TO_TICKS(1000)) != pdTRUE)
+    if (xQueueSendToFront(websocket_tx_queue, &cmd, pdMS_TO_TICKS(100)) != pdTRUE)
         ESP_LOGW(TAG, "SETUP queue full");
 }
 
 void websocket_app_start(void)
 {
-    if (!wifi_is_ready() || client || ws_started) return;
+    if (!wifi_is_ready() || client || ws_started || ws_cleanup_pending) return;
     if (!start_audio_playback()) return;
     clear_audio_buffer();
     reset_audio_turn_stats();
@@ -170,6 +226,7 @@ void websocket_app_start(void)
     is_connected = false;
     setup_complete = false;
     websocket_tx_error = false;
+    ws_close_requested = false;
 
     esp_websocket_client_config_t cfg = {};
     cfg.uri = WEBSOCKET_SERVER_URL;
@@ -189,11 +246,15 @@ void websocket_app_start(void)
     esp_err_t err = esp_websocket_register_events(client, WEBSOCKET_EVENT_ANY,
                                                    websocket_event_handler, (void *)client);
     if (err != ESP_OK) {
-        esp_websocket_client_destroy(client); client = NULL; return;
+        esp_websocket_client_destroy(client);
+        client = NULL;
+        return;
     }
     err = esp_websocket_client_start(client);
     if (err != ESP_OK) {
-        esp_websocket_client_destroy(client); client = NULL; return;
+        esp_websocket_client_destroy(client);
+        client = NULL;
+        return;
     }
     ws_started = true;
     ESP_LOGI(TAG, "Gemini Live client started");
@@ -206,7 +267,22 @@ bool websocket_is_connected(void)
 
 void websocket_disconnect(void)
 {
-    if (client) esp_websocket_client_close(client, pdMS_TO_TICKS(1000));
+    esp_websocket_client_handle_t ws = client;
+    if (!ws || ws_close_requested) return;
+    ws_close_requested = true;
+    ESP_LOGW(TAG, "Requesting WebSocket close for recovery");
+    esp_err_t err = esp_websocket_client_close(ws, pdMS_TO_TICKS(1000));
+    if (err != ESP_OK) ESP_LOGW(TAG, "WebSocket close returned: %s", esp_err_to_name(err));
 }
 
 void websocket_reset_started(void) { ws_started = false; }
+
+void websocket_cleanup_finished(esp_websocket_client_handle_t old_client)
+{
+    if (!ws_cleanup_queue || !old_client) return;
+    ws_cleanup_pending = true;
+    if (xQueueSend(ws_cleanup_queue, &old_client, 0) != pdTRUE) {
+        ws_cleanup_pending = false;
+        ESP_LOGE(TAG, "WebSocket cleanup queue full; old client not destroyed yet");
+    }
+}
