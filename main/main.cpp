@@ -128,11 +128,10 @@ static void session_supervisor_task(void *arg)
         } else if (websocket_tx_error) {
             // esp_websocket_client v1.7.0 aborts the connection itself after a transport
             // send failure and drives the ERROR/DISCONNECTED/FINISH lifecycle. Do not
-            // issue a second blocking close here. Wait until FINISH clears client/ws_started,
-            // then create a fresh client on the next supervisor iteration.
-            if (!client && !ws_started) {
-                websocket_app_start();
-            }
+            // issue a second blocking close here. websocket_app_start() has its own
+            // client/ws_started/cleanup guards, so it is safe to call until FINISH
+            // clears the old client; it then creates the fresh session.
+            websocket_app_start();
         } else {
             (void)websocket_healthcheck();
             if (!websocket_is_connected()) websocket_app_start();
