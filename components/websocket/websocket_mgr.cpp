@@ -47,9 +47,18 @@ uint32_t websocket_tx_frames = 0;
 uint64_t websocket_tx_bytes = 0;
 uint32_t websocket_tx_drops = 0;
 UBaseType_t websocket_tx_high_water = 0;
+uint32_t websocket_tx_encode_count = 0;
+uint64_t websocket_tx_encode_total_us = 0;
+uint32_t websocket_tx_encode_max_us = 0;
+uint32_t websocket_tx_json_count = 0;
+uint64_t websocket_tx_json_total_us = 0;
+uint32_t websocket_tx_json_max_us = 0;
+uint32_t websocket_tx_write_count = 0;
 uint64_t websocket_tx_write_total_us = 0;
 uint32_t websocket_tx_write_max_us = 0;
 uint32_t websocket_tx_write_slow = 0;
+uint32_t websocket_tx_write_fail = 0;
+uint32_t websocket_tx_write_timeout = 0;
 
 uint32_t websocket_rx_messages = 0;
 uint32_t websocket_rx_fragments = 0;
@@ -87,8 +96,10 @@ static void websocket_tx_fail(void)
     setup_complete = false;
     ++websocket_connection_generation;
     websocket_tx_flush_queue();
-    ESP_LOGW(TAG, "TX transport unhealthy; invalidating generation and requesting reconnect");
-    websocket_disconnect();
+    ESP_LOGW(TAG, "TX transport unhealthy; generation invalidated, stale audio flushed, recovery requested");
+    // Do not call websocket_disconnect() from the realtime TX worker. A failed send in
+    // esp_websocket_client v1.7.0 may already abort the transport, while an explicit
+    // close() can wait for the client task. The supervisor owns the blocking recovery path.
 }
 
 static void websocket_tx_task(void *arg)
@@ -97,7 +108,6 @@ static void websocket_tx_task(void *arg)
     ws_tx_command_t cmd = {};
     static char b64_buf[1024];
     static char json_buf[1200];
-    uint32_t consecutive_slow = 0;
 
     ESP_LOGI(TAG, "TX worker: core=%d priority=%d queue=%d frame=%d bytes/20ms",
              xPortGetCoreID(), uxTaskPriorityGet(NULL), WS_TX_QUEUE_LENGTH, WS_TX_AUDIO_SIZE);
@@ -120,18 +130,32 @@ static void websocket_tx_task(void *arg)
         }
 
         if (cmd.type != WS_TX_COMMAND_AUDIO || cmd.len != WS_TX_AUDIO_SIZE) continue;
+
+        int64_t encode_start_us = esp_timer_get_time();
         size_t encoded_len = 0;
         int ret = mbedtls_base64_encode((unsigned char *)b64_buf, sizeof(b64_buf) - 1,
                                         &encoded_len, cmd.data, cmd.len);
+        uint32_t encode_us = (uint32_t)(esp_timer_get_time() - encode_start_us);
+        ++websocket_tx_encode_count;
+        websocket_tx_encode_total_us += encode_us;
+        if (encode_us > websocket_tx_encode_max_us) websocket_tx_encode_max_us = encode_us;
         if (ret != 0) { ++websocket_tx_drops; continue; }
         b64_buf[encoded_len] = '\0';
+
+        int64_t json_start_us = esp_timer_get_time();
         int json_len = snprintf(json_buf, sizeof(json_buf),
             "{\"realtimeInput\":{\"audio\":{\"mimeType\":\"audio/pcm;rate=16000\",\"data\":\"%s\"}}}",
             b64_buf);
+        uint32_t json_us = (uint32_t)(esp_timer_get_time() - json_start_us);
+        ++websocket_tx_json_count;
+        websocket_tx_json_total_us += json_us;
+        if (json_us > websocket_tx_json_max_us) websocket_tx_json_max_us = json_us;
         if (json_len <= 0 || (size_t)json_len >= sizeof(json_buf)) { ++websocket_tx_drops; continue; }
 
         int64_t start_us = esp_timer_get_time();
-        int sent = esp_websocket_client_send_text(ws, json_buf, json_len, pdMS_TO_TICKS(10));
+        ++websocket_tx_write_count;
+        int sent = esp_websocket_client_send_text(ws, json_buf, json_len,
+                                                   pdMS_TO_TICKS(WS_TX_AUDIO_SEND_TIMEOUT_MS));
         uint32_t write_us = (uint32_t)(esp_timer_get_time() - start_us);
         websocket_tx_write_total_us += write_us;
         if (write_us > websocket_tx_write_max_us) websocket_tx_write_max_us = write_us;
@@ -139,21 +163,24 @@ static void websocket_tx_task(void *arg)
         if (sent == json_len) {
             ++websocket_tx_frames;
             websocket_tx_bytes += cmd.len;
-            if (write_us >= 80000) {
+            if (write_us >= WS_TX_AUDIO_SLOW_THRESHOLD_US) {
                 ++websocket_tx_write_slow;
-                if (++consecutive_slow >= 3) {
-                    ESP_LOGW(TAG, "TX send repeatedly slow: write_us=%u count=%lu", (unsigned)write_us, (unsigned long)consecutive_slow);
-                    websocket_tx_fail();
-                    consecutive_slow = 0;
-                }
-            } else {
-                consecutive_slow = 0;
+                ESP_LOGW(TAG, "TX send slow: write_us=%u expected=%d", (unsigned)write_us, json_len);
             }
         } else {
+            ++websocket_tx_write_fail;
             ++websocket_tx_drops;
-            ESP_LOGW(TAG, "TX write fail: sent=%d expected=%d write_us=%u", sent, json_len, (unsigned)write_us);
+            // esp_websocket_client returns zero for a transport write that produced no
+            // bytes; count it as a realtime timeout when the measured call consumed the
+            // configured timeout window. The public API does not expose a dedicated
+            // timeout result, so do not pretend to know more than the API reports.
+            if (sent == 0 && write_us >= (WS_TX_AUDIO_SEND_TIMEOUT_MS * 1000U)) {
+                ++websocket_tx_write_timeout;
+            }
+            ESP_LOGW(TAG, "TX write fail: sent=%d expected=%d write_us=%u timeout=%u",
+                     sent, json_len, (unsigned)write_us,
+                     (unsigned)websocket_tx_write_timeout);
             websocket_tx_fail();
-            consecutive_slow = 0;
         }
     }
 }
