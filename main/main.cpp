@@ -80,15 +80,16 @@ static void audio_capture_task(void *arg)
                      (unsigned long)interval_max_us, (unsigned long)drops,
                      (unsigned)esp_get_free_heap_size(),
                      (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
-            ESP_LOGI(TAG, "VOICE profile: gen=%lu TX frames=%lu bytes=%llu drops=%lu q_hwm=%u write_avg_us=%lu write_max_us=%lu slow=%lu | RX msg=%lu frag=%lu drops=%lu q_hwm=%u process_avg_us=%lu process_max_us=%lu | WiFi reconnect=%lu WS reconnect=%lu",
+            ESP_LOGI(TAG, "VOICE profile: gen=%lu TX q=%u/%u hwm=%u frames=%lu bytes=%llu drops=%lu write_avg_us=%lu write_max_us=%lu slow=%lu | RX q=%u/%u hwm=%u msg=%lu frag=%lu drops=%lu process_avg_us=%lu process_max_us=%lu | WiFi reconnect=%lu WS reconnect=%lu",
                      (unsigned long)websocket_connection_generation,
+                     (unsigned)websocket_get_tx_queue_depth(), (unsigned)3, (unsigned)websocket_tx_high_water,
                      (unsigned long)websocket_tx_frames, (unsigned long long)websocket_tx_bytes,
-                     (unsigned long)websocket_tx_drops, (unsigned)websocket_tx_high_water,
-                     (unsigned long)tx_avg, (unsigned long)websocket_tx_write_max_us,
-                     (unsigned long)websocket_tx_write_slow,
+                     (unsigned long)websocket_tx_drops, (unsigned long)tx_avg,
+                     (unsigned long)websocket_tx_write_max_us, (unsigned long)websocket_tx_write_slow,
+                     (unsigned)websocket_get_rx_queue_depth(), (unsigned)4, (unsigned)websocket_rx_high_water,
                      (unsigned long)websocket_rx_messages, (unsigned long)websocket_rx_fragments,
-                     (unsigned long)websocket_rx_drops, (unsigned)websocket_rx_high_water,
-                     (unsigned long)rx_avg, (unsigned long)websocket_rx_process_max_us,
+                     (unsigned long)websocket_rx_drops, (unsigned long)rx_avg,
+                     (unsigned long)websocket_rx_process_max_us,
                      (unsigned long)wifi_get_reconnect_count(),
                      (unsigned long)websocket_get_reconnect_count());
         }
