@@ -6,6 +6,8 @@
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
 #include "esp_psram.h"
+#include "esp_system.h"
+#include "esp_wifi.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -19,21 +21,9 @@
 #include <sys/time.h>
 
 static const char *TAG = "VOICE_REF";
-
-/*
- * Reference voice path:
- *   MIC PCM16 16 kHz mono -> 20 ms frame -> WebSocket TX
- *   Gemini Live RX -> PCM16 24 kHz -> speaker
- *
- * No wake-word, OLED, UART, or UI state machine participates in this path.
- * The Gemini WebSocket session is started once and kept alive across turns.
- */
-#define MIC_FRAME_BYTES              640U   /* 320 samples = 20 ms */
-#define MIC_FRAME_INTERVAL_US        20000LL
-#define WIFI_WAIT_TIMEOUT_MS         15000U
-
-/* Optional transport-only test. Build with -DVOICE_REFERENCE_SYNTHETIC_TX=1
- * to replace the physical microphone with deterministic PCM test frames. */
+#define MIC_FRAME_BYTES 640U
+#define MIC_FRAME_INTERVAL_US 20000LL
+#define WIFI_WAIT_TIMEOUT_MS 15000U
 #ifndef VOICE_REFERENCE_SYNTHETIC_TX
 #define VOICE_REFERENCE_SYNTHETIC_TX 0
 #endif
@@ -45,21 +35,12 @@ static void sync_network_time(void)
     esp_sntp_setservername(0, "time.google.com");
     esp_sntp_setservername(1, "id.pool.ntp.org");
     esp_sntp_init();
-
     for (int retry = 0; retry < 20; ++retry) {
-        time_t now = 0;
-        struct tm info = {};
-        time(&now);
-        localtime_r(&now, &info);
-        if (info.tm_year >= (2024 - 1900)) {
-            ESP_LOGI(TAG, "NTP READY: year=%d", info.tm_year + 1900);
-            return;
-        }
+        time_t now = 0; struct tm info = {};
+        time(&now); localtime_r(&now, &info);
+        if (info.tm_year >= (2024 - 1900)) { ESP_LOGI(TAG, "NTP READY: year=%d", info.tm_year + 1900); return; }
         vTaskDelay(pdMS_TO_TICKS(250));
     }
-
-    /* TLS certificate validation needs a sane clock. Keep the same fallback
-     * behavior as the previous application, but do not involve any UI. */
     struct timeval fallback = { .tv_sec = 1770000000, .tv_usec = 0 };
     settimeofday(&fallback, NULL);
     ESP_LOGW(TAG, "NTP timeout; fallback time installed");
@@ -80,19 +61,14 @@ static void log_voice_profile(uint64_t frames, uint64_t tx_ok, uint64_t tx_drop,
                               uint64_t interval_sum_us, uint32_t interval_max_us,
                               uint64_t interval_count)
 {
-    size_t heap = esp_get_free_heap_size();
-    size_t internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-    size_t psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
     ESP_LOGI(TAG,
              "MIC PROFILE: frames=%llu tx_ok=%llu tx_drop=%llu interval_avg_us=%llu interval_max_us=%u heap=%u internal=%u psram=%u",
-             (unsigned long long)frames,
-             (unsigned long long)tx_ok,
-             (unsigned long long)tx_drop,
+             (unsigned long long)frames, (unsigned long long)tx_ok, (unsigned long long)tx_drop,
              (unsigned long long)(interval_count ? interval_sum_us / interval_count : 0),
              (unsigned)interval_max_us,
-             (unsigned)heap,
-             (unsigned)internal,
-             (unsigned)psram);
+             (unsigned)esp_get_free_heap_size(),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 }
 
 #if VOICE_REFERENCE_SYNTHETIC_TX
@@ -100,38 +76,23 @@ static void synthetic_transport_task(void *arg)
 {
     (void)arg;
     static uint8_t frame[MIC_FRAME_BYTES];
-    uint32_t phase = 0;
-    uint64_t frames = 0;
-    uint64_t drops = 0;
+    uint32_t phase = 0; uint64_t frames = 0; uint64_t drops = 0;
     int64_t next_deadline = esp_timer_get_time();
-
     ESP_LOGI(TAG, "TEST A: synthetic PCM TX transport mode ENABLED");
     for (;;) {
         int16_t *pcm = reinterpret_cast<int16_t *>(frame);
-        for (size_t i = 0; i < MIC_FRAME_BYTES / sizeof(int16_t); ++i) {
-            /* Cheap deterministic waveform; no DSP and no heap allocation. */
-            pcm[i] = ((phase++ % 40U) < 20U) ? 1200 : -1200;
-        }
-
+        for (size_t i = 0; i < MIC_FRAME_BYTES / sizeof(int16_t); ++i) pcm[i] = ((phase++ % 40U) < 20U) ? 1200 : -1200;
         if (websocket_is_connected()) {
-            if (websocket_send_audio_data(frame, sizeof(frame))) ++frames;
-            else ++drops;
+            if (websocket_send_audio_data(frame, sizeof(frame))) ++frames; else ++drops;
         }
-
         next_deadline += MIC_FRAME_INTERVAL_US;
         int64_t wait_us = next_deadline - esp_timer_get_time();
         if (wait_us > 0) {
             TickType_t ticks = pdMS_TO_TICKS((uint32_t)((wait_us + 999) / 1000));
             if (ticks > 0) vTaskDelay(ticks);
-        } else {
-            next_deadline = esp_timer_get_time();
-            vTaskDelay(1);
-        }
-
-        if ((frames + drops) % 250 == 0) {
-            ESP_LOGI(TAG, "TEST A: frames=%llu drops=%llu", (unsigned long long)frames,
-                     (unsigned long long)drops);
-        }
+        } else { next_deadline = esp_timer_get_time(); vTaskDelay(1); }
+        if ((frames + drops) % 250 == 0)
+            ESP_LOGI(TAG, "TEST A: frames=%llu drops=%llu", (unsigned long long)frames, (unsigned long long)drops);
     }
 }
 #endif
@@ -140,55 +101,29 @@ static void microphone_task(void *arg)
 {
     (void)arg;
     static uint8_t frame[MIC_FRAME_BYTES];
-    uint64_t frames = 0;
-    uint64_t tx_ok = 0;
-    uint64_t tx_drop = 0;
-    uint64_t interval_sum_us = 0;
+    uint64_t frames = 0, tx_ok = 0, tx_drop = 0, interval_sum_us = 0, interval_count = 0;
     uint32_t interval_max_us = 0;
-    uint64_t interval_count = 0;
-    int64_t previous_capture_us = 0;
-    int64_t last_profile_us = esp_timer_get_time();
-
+    int64_t previous_capture_us = 0, last_profile_us = esp_timer_get_time();
     ESP_LOGI(TAG, "MIC task: PCM16 mono 16kHz, frame=%u bytes/20ms", MIC_FRAME_BYTES);
 
     for (;;) {
         size_t got = audio_read_mic(frame, sizeof(frame));
-        if (got != sizeof(frame)) {
-            ESP_LOGW(TAG, "MIC short read: %u/%u", (unsigned)got, (unsigned)sizeof(frame));
-            continue;
-        }
-
+        if (got != sizeof(frame)) { ESP_LOGW(TAG, "MIC short read: %u/%u", (unsigned)got, (unsigned)sizeof(frame)); continue; }
         int64_t now = esp_timer_get_time();
         if (previous_capture_us != 0) {
             uint32_t interval = (uint32_t)(now - previous_capture_us);
-            interval_sum_us += interval;
-            ++interval_count;
-            if (interval > interval_max_us) interval_max_us = interval;
+            interval_sum_us += interval; ++interval_count; if (interval > interval_max_us) interval_max_us = interval;
         }
-        previous_capture_us = now;
-        ++frames;
-
-        /* Gemini Live AAD remains authoritative for turn detection. We only
-         * suppress pure silence before the first active speech frame so the
-         * reference path does not create needless network traffic. */
+        previous_capture_us = now; ++frames;
         if (!frame_has_activity(frame, sizeof(frame))) {
+            int64_t profile_now = esp_timer_get_time();
+            if (profile_now - last_profile_us >= 5000000LL) { log_voice_profile(frames, tx_ok, tx_drop, interval_sum_us, interval_max_us, interval_count); last_profile_us = profile_now; }
             continue;
         }
-
-        if (!websocket_is_connected()) {
-            vTaskDelay(1);
-            continue;
-        }
-
-        if (websocket_send_audio_data(frame, sizeof(frame))) ++tx_ok;
-        else ++tx_drop;
-
+        if (!websocket_is_connected()) { vTaskDelay(1); continue; }
+        if (websocket_send_audio_data(frame, sizeof(frame))) ++tx_ok; else ++tx_drop;
         int64_t profile_now = esp_timer_get_time();
-        if (profile_now - last_profile_us >= 5000000LL) {
-            log_voice_profile(frames, tx_ok, tx_drop, interval_sum_us,
-                              interval_max_us, interval_count);
-            last_profile_us = profile_now;
-        }
+        if (profile_now - last_profile_us >= 5000000LL) { log_voice_profile(frames, tx_ok, tx_drop, interval_sum_us, interval_max_us, interval_count); last_profile_us = profile_now; }
     }
 }
 
@@ -202,38 +137,27 @@ extern "C" void app_main()
              (unsigned)esp_get_free_heap_size());
 
     esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ret = nvs_flash_init();
-    }
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) { ESP_ERROR_CHECK(nvs_flash_erase()); ret = nvs_flash_init(); }
     ESP_ERROR_CHECK(ret);
 
     audio_hal_init();
     audio_i2s_test_tone();
-
     wifi_init_sta();
     if (!wifi_wait_for_connection(WIFI_WAIT_TIMEOUT_MS)) {
         ESP_LOGE(TAG, "WiFi tidak READY; reference test dihentikan");
         for (;;) vTaskDelay(pdMS_TO_TICKS(1000));
     }
-
-    /* WiFi power-save can add latency/jitter to a realtime audio transport. */
     esp_wifi_set_ps(WIFI_PS_NONE);
     ESP_LOGI(TAG, "WiFi READY; power save OFF");
-
     sync_network_time();
-
-    /* Exactly one Gemini Live session for the lifetime of the test. */
     websocket_app_start();
 
 #if VOICE_REFERENCE_SYNTHETIC_TX
-    BaseType_t test_task = xTaskCreate(synthetic_transport_task, "voice_test_tx",
-                                       4096, NULL, 5, NULL);
-    if (test_task != pdPASS) ESP_LOGE(TAG, "Gagal membuat TEST A task");
+    if (xTaskCreate(synthetic_transport_task, "voice_test_tx", 4096, NULL, 5, NULL) != pdPASS)
+        ESP_LOGE(TAG, "Gagal membuat TEST A task");
 #else
-    BaseType_t mic_task = xTaskCreatePinnedToCore(microphone_task, "voice_mic",
-                                                  4096, NULL, 5, NULL, 1);
-    if (mic_task != pdPASS) ESP_LOGE(TAG, "Gagal membuat MIC task");
+    if (xTaskCreatePinnedToCore(microphone_task, "voice_mic", 4096, NULL, 5, NULL, 1) != pdPASS)
+        ESP_LOGE(TAG, "Gagal membuat MIC task");
 #endif
 
     ESP_LOGI(TAG, "REFERENCE READY: MIC <-> GEMINI <-> SPEAKER");
