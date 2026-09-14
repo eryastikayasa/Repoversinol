@@ -126,11 +126,13 @@ static void session_supervisor_task(void *arg)
         if (!wifi_ready) {
             websocket_disconnect();
         } else if (websocket_tx_error) {
-            // Recovery is intentionally kept out of the realtime TX worker. A transport
-            // failure may already have caused esp_websocket_client to abort the socket;
-            // this supervisor performs the potentially blocking close/reconnect path.
-            websocket_disconnect();
-            if (!websocket_is_connected()) websocket_app_start();
+            // esp_websocket_client v1.7.0 aborts the connection itself after a transport
+            // send failure and drives the ERROR/DISCONNECTED/FINISH lifecycle. Do not
+            // issue a second blocking close here. Wait until FINISH clears client/ws_started,
+            // then create a fresh client on the next supervisor iteration.
+            if (!client && !ws_started) {
+                websocket_app_start();
+            }
         } else {
             (void)websocket_healthcheck();
             if (!websocket_is_connected()) websocket_app_start();
