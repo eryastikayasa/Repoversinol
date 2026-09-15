@@ -113,6 +113,8 @@ bool build_gemini_setup(char **output, size_t *output_len);
 void process_gemini_message(const char *json, size_t len);
 void clear_session_handle(void);
 bool store_session_handle(const char *handle);
+bool websocket_goaway_reconnect_pending(void);
+void websocket_clear_goaway_reconnect(void);
 size_t get_audio_pending_bytes(void);
 bool start_audio_playback(void);
 void clear_audio_buffer(void);
