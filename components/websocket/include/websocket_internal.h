@@ -19,8 +19,10 @@
 #define WS_TX_AUDIO_SEND_TIMEOUT_MS 10
 #define WS_TX_AUDIO_SLOW_THRESHOLD_US 30000
 #define WS_TX_RETRY_WINDOW_MS 3000
+#define WS_MANUAL_VAD_SILENCE_MS 1200
+#define WS_MANUAL_VAD_RMS_THRESHOLD 450
 
-typedef enum { WS_TX_COMMAND_SETUP = 1, WS_TX_COMMAND_AUDIO = 2 } ws_tx_command_type_t;
+typedef enum { WS_TX_COMMAND_SETUP = 1, WS_TX_COMMAND_AUDIO = 2, WS_TX_COMMAND_ACTIVITY_START = 3, WS_TX_COMMAND_ACTIVITY_END = 4 } ws_tx_command_type_t;
 typedef enum {
     LIVE_ST_DISCONNECTED = 0,
     LIVE_ST_CONNECTING,
@@ -40,6 +42,8 @@ extern QueueHandle_t websocket_tx_queue;
 extern TaskHandle_t websocket_tx_task_handle;
 bool websocket_tx_init(void);
 bool websocket_tx_enqueue_audio(const uint8_t *data, size_t len, uint32_t generation);
+bool websocket_tx_enqueue_activity_start(uint32_t generation);
+bool websocket_tx_enqueue_activity_end(uint32_t generation);
 void websocket_tx_flush_queue(void);
 
 typedef struct {
@@ -66,12 +70,17 @@ extern uint32_t websocket_connection_generation;
 extern char session_handle[SESSION_HANDLE_MAX_LEN];
 extern bool session_resumable;
 extern uint32_t websocket_turn_count;
+extern uint32_t websocket_model_turn_count;
+extern uint32_t websocket_interrupted_count;
 extern uint32_t websocket_goaway_count;
+extern uint32_t websocket_activity_start_count;
+extern uint32_t websocket_activity_end_count;
 
 extern StreamBufferHandle_t audio_stream;
 extern TaskHandle_t audio_playback_task_handle;
 extern volatile bool audio_turn_active;
 extern volatile bool audio_turn_complete_pending;
+uint32_t websocket_get_reconnect_count(void);
 extern uint32_t audio_chunks_received;
 extern uint64_t audio_bytes_received;
 extern uint64_t audio_bytes_queued;
