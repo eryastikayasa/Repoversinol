@@ -129,6 +129,12 @@ void wifi_init_sta(void)
         ESP_LOGE(TAG, "esp_wifi_start gagal: %s", esp_err_to_name(err)); return;
     }
 
+    err = esp_wifi_set_ps(WIFI_PS_NONE);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wifi_set_ps(WIFI_PS_NONE) gagal: %s", esp_err_to_name(err));
+        return;
+    }
+    ESP_LOGI(TAG, "Wi-Fi power save DISABLED (WIFI_PS_NONE)");
     ESP_LOGI(TAG, "Wi-Fi driver STARTED");
 }
 
