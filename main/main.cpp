@@ -129,15 +129,12 @@ static void session_supervisor_task(void *arg)
         if (!wifi_ready) {
             websocket_disconnect();
         } else if (websocket_goaway_reconnect_pending() && client) {
-            // goAway is a proactive server request. Stop/start the SAME client so the
-            // saved Gemini session-resumption handle is reused on the next setup.
-            ESP_LOGW(TAG, "WS supervisor: proactive reconnect for goAway, resume=%s",
+            // Gemini goAway is a proactive warning. Keep the existing client alive and
+            // let the server close it; esp_websocket_client then auto-reconnects. The
+            // CONNECTED event sends setup with the preserved session-resumption handle.
+            ESP_LOGW(TAG, "WS supervisor: goAway acknowledged; waiting for reconnect, resume=%s",
                      session_resumable ? "yes" : "no");
             websocket_clear_goaway_reconnect();
-            websocket_tx_error = true;
-            websocket_live_state = LIVE_ST_RECONNECTING;
-            websocket_tx_flush_queue();
-            esp_websocket_client_stop(client);
         } else if (websocket_tx_error) {
             // With auto reconnect enabled, keep the existing client alive. The client
             // will emit CONNECTED again; that event queues a fresh setup using the
