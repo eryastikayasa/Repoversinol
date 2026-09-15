@@ -12,6 +12,7 @@
 #include "freertos/task.h"
 #include <stdint.h>
 #include <stddef.h>
+#include <math.h>
 
 #ifndef VOICE_SYNTHETIC_TEST
 #define VOICE_SYNTHETIC_TEST 0
@@ -208,7 +209,6 @@ extern "C" void app_main()
 
     audio_hal_init();
     wifi_init_sta();
-    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 
     if (!wifi_wait_for_connection(5000))
         ESP_LOGW(TAG, "Wi-Fi not ready yet; continuing with offline-safe voice workers");
