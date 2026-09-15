@@ -27,10 +27,13 @@ void websocket_event_handler(void *handler_args, esp_event_base_t base,
             is_connected = true;
             setup_complete = false;
             websocket_tx_error = false;
+            websocket_live_state = LIVE_ST_CONNECTING;
             ++websocket_connection_generation;
             websocket_note_connected();
-            ESP_LOGI(TAG, "WebSocket CONNECTED generation=%lu",
-                     (unsigned long)websocket_connection_generation);
+            ESP_LOGI(TAG, "WebSocket CONNECTED generation=%lu reconnect_count=%lu resume=%s",
+                     (unsigned long)websocket_connection_generation,
+                     (unsigned long)websocket_get_reconnect_count(),
+                     session_resumable ? "yes" : "no");
             websocket_tx_flush_queue();
             websocket_rx_flush_queue();
             websocket_rx_request_reset();
@@ -58,18 +61,23 @@ void websocket_event_handler(void *handler_args, esp_event_base_t base,
             is_connected = false;
             setup_complete = false;
             websocket_tx_error = true;
+            websocket_live_state = LIVE_ST_RECONNECTING;
             invalidate_connection_generation();
             websocket_tx_flush_queue();
             websocket_rx_flush_queue();
             websocket_rx_request_reset();
+            ESP_LOGW(TAG, "Transport error; client retained for automatic reconnect, resume=%s",
+                     session_resumable ? "yes" : "no");
             break;
 
         case WEBSOCKET_EVENT_DISCONNECTED:
         case WEBSOCKET_EVENT_CLOSED:
-            ESP_LOGW(TAG, "WebSocket DISCONNECTED/CLOSED");
+            ESP_LOGW(TAG, "WebSocket DISCONNECTED/CLOSED; waiting for automatic reconnect resume=%s",
+                     session_resumable ? "yes" : "no");
             is_connected = false;
             setup_complete = false;
             websocket_tx_error = true;
+            websocket_live_state = LIVE_ST_RECONNECTING;
             invalidate_connection_generation();
             websocket_tx_flush_queue();
             websocket_rx_flush_queue();
