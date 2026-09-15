@@ -19,6 +19,20 @@
 
 static const char *TAG = "MAIN";
 static constexpr size_t AUDIO_FRAME_BYTES = 640;
+static constexpr int64_t VAD_SILENCE_US = (int64_t)WS_MANUAL_VAD_SILENCE_MS * 1000LL;
+
+static uint32_t pcm_rms(const uint8_t *data, size_t len)
+{
+    if (!data || len < 2) return 0;
+    const int16_t *samples = reinterpret_cast<const int16_t *>(data);
+    const size_t count = len / sizeof(int16_t);
+    uint64_t sum_sq = 0;
+    for (size_t i = 0; i < count; ++i) {
+        const int32_t s = samples[i];
+        sum_sq += (uint64_t)(s * s);
+    }
+    return count ? (uint32_t)sqrt((double)sum_sq / (double)count) : 0;
+}
 
 static void audio_capture_task(void *arg)
 {
@@ -35,11 +49,13 @@ static void audio_capture_task(void *arg)
     uint32_t interval_max_us = 0;
     uint32_t drops = 0;
     int64_t last_log_us = esp_timer_get_time();
+    bool activity_active = false;
+    int64_t silence_since_us = 0;
 
 #if VOICE_SYNTHETIC_TEST
     ESP_LOGW(TAG, "TEST A ENABLED: synthetic PCM16 16kHz mono, 640 bytes every 20ms");
 #else
-    ESP_LOGI(TAG, "MIC: PCM16 mono 16kHz, 320 samples / 640 bytes / 20ms");
+    ESP_LOGI(TAG, "MIC: PCM16 mono 16kHz, 320 samples / 640 bytes / 20ms; manual VAD enabled");
 #endif
 
     for (;;) {
@@ -62,11 +78,40 @@ static void audio_capture_task(void *arg)
             if (interval > interval_max_us) interval_max_us = interval;
         }
         last_us = now_us;
-
         ++frames;
-        if (websocket_is_connected() &&
-            !websocket_tx_enqueue_audio(frame, sizeof(frame), websocket_connection_generation)) {
-            ++drops;
+
+        const uint32_t rms = pcm_rms(frame, sizeof(frame));
+        const bool voiced = rms >= WS_MANUAL_VAD_RMS_THRESHOLD;
+
+        if (websocket_is_connected()) {
+            if (voiced) {
+                silence_since_us = 0;
+                if (!activity_active) {
+                    if (websocket_tx_enqueue_activity_start(websocket_connection_generation)) {
+                        activity_active = true;
+                        ESP_LOGI(TAG, "VAD: voice detected rms=%lu -> activityStart",
+                                 (unsigned long)rms);
+                    }
+                }
+                if (activity_active &&
+                    !websocket_tx_enqueue_audio(frame, sizeof(frame), websocket_connection_generation)) {
+                    ++drops;
+                }
+            } else if (activity_active) {
+                if (silence_since_us == 0) silence_since_us = now_us;
+                if (now_us - silence_since_us >= VAD_SILENCE_US) {
+                    if (websocket_tx_enqueue_activity_end(websocket_connection_generation)) {
+                        ESP_LOGI(TAG, "VAD: silence=%llums rms=%lu -> activityEnd",
+                                 (unsigned long long)((now_us - silence_since_us) / 1000LL),
+                                 (unsigned long)rms);
+                        activity_active = false;
+                        silence_since_us = 0;
+                    }
+                }
+            }
+        } else {
+            activity_active = false;
+            silence_since_us = 0;
         }
 
         if (now_us - last_log_us >= 5000000) {
@@ -80,9 +125,10 @@ static void audio_capture_task(void *arg)
                 (uint32_t)(websocket_tx_write_total_us / websocket_tx_write_count) : 0;
             uint32_t rx_avg = websocket_rx_messages ?
                 (uint32_t)(websocket_rx_process_total_us / websocket_rx_messages) : 0;
-            ESP_LOGI(TAG, "MIC profile: frames=%llu interval_avg_us=%lu interval_max_us=%lu drops=%lu heap=%u psram=%u",
+            ESP_LOGI(TAG, "MIC profile: frames=%llu interval_avg_us=%lu interval_max_us=%lu drops=%lu rms=%lu vad=%s heap=%u psram=%u",
                      (unsigned long long)frames, (unsigned long)avg_interval,
                      (unsigned long)interval_max_us, (unsigned long)drops,
+                     (unsigned long)rms, activity_active ? "active" : "idle",
                      (unsigned)esp_get_free_heap_size(),
                      (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
             ESP_LOGI(TAG, "TX profile: q=%u/3 hwm=%u frames=%lu bytes=%llu drops=%lu | encode=%lu avg=%lu max=%lu | json=%lu avg=%lu max=%lu | write=%lu avg=%lu max=%lu slow=%lu fail=%lu timeout=%lu",
@@ -103,7 +149,7 @@ static void audio_capture_task(void *arg)
                      (unsigned long)websocket_tx_write_slow,
                      (unsigned long)websocket_tx_write_fail,
                      (unsigned long)websocket_tx_write_timeout);
-            ESP_LOGI(TAG, "RX profile: q=%u/4 hwm=%u msg=%lu frag=%lu drops=%lu process_avg_us=%lu process_max_us=%lu | WiFi reconnect=%lu WS reconnect=%lu turns=%lu resume=%s goAway=%lu",
+            ESP_LOGI(TAG, "RX profile: q=%u/4 hwm=%u msg=%lu frag=%lu drops=%lu process_avg_us=%lu process_max_us=%lu | WiFi reconnect=%lu WS reconnect=%lu turns=%lu modelTurn=%lu interrupted=%lu resume=%s goAway=%lu activityStart=%lu activityEnd=%lu",
                      (unsigned)websocket_get_rx_queue_depth(),
                      (unsigned)websocket_rx_high_water,
                      (unsigned long)websocket_rx_messages,
@@ -114,8 +160,12 @@ static void audio_capture_task(void *arg)
                      (unsigned long)wifi_get_reconnect_count(),
                      (unsigned long)websocket_get_reconnect_count(),
                      (unsigned long)websocket_turn_count,
+                     (unsigned long)websocket_model_turn_count,
+                     (unsigned long)websocket_interrupted_count,
                      session_resumable ? "yes" : "no",
-                     (unsigned long)websocket_goaway_count);
+                     (unsigned long)websocket_goaway_count,
+                     (unsigned long)websocket_activity_start_count,
+                     (unsigned long)websocket_activity_end_count);
         }
     }
 }
@@ -129,16 +179,10 @@ static void session_supervisor_task(void *arg)
         if (!wifi_ready) {
             websocket_disconnect();
         } else if (websocket_goaway_reconnect_pending() && client) {
-            // Gemini goAway is a proactive warning. Keep the existing client alive and
-            // let the server close it; esp_websocket_client then auto-reconnects. The
-            // CONNECTED event sends setup with the preserved session-resumption handle.
             ESP_LOGW(TAG, "WS supervisor: goAway acknowledged; waiting for reconnect, resume=%s",
                      session_resumable ? "yes" : "no");
             websocket_clear_goaway_reconnect();
         } else if (websocket_tx_error) {
-            // With auto reconnect enabled, keep the existing client alive. The client
-            // will emit CONNECTED again; that event queues a fresh setup using the
-            // preserved session-resumption handle.
             if (!client) websocket_app_start();
         } else {
             (void)websocket_healthcheck();
