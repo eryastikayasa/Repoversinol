@@ -16,13 +16,20 @@
 #define WS_RX_FRAGMENT_SIZE (8 * 1024)
 #define WS_RX_POOL_COUNT 4
 #define WS_RX_QUEUE_LENGTH WS_RX_POOL_COUNT
-
-// Realtime audio must not be held by the transport for the 100 ms legacy timeout.
-// 10 ms is intentionally below one 20 ms PCM frame period.
 #define WS_TX_AUDIO_SEND_TIMEOUT_MS 10
 #define WS_TX_AUDIO_SLOW_THRESHOLD_US 30000
+#define WS_TX_RETRY_WINDOW_MS 3000
 
 typedef enum { WS_TX_COMMAND_SETUP = 1, WS_TX_COMMAND_AUDIO = 2 } ws_tx_command_type_t;
+typedef enum {
+    LIVE_ST_DISCONNECTED = 0,
+    LIVE_ST_CONNECTING,
+    LIVE_ST_SETUP_SENT,
+    LIVE_ST_READY,
+    LIVE_ST_SPEAKING,
+    LIVE_ST_RECONNECTING
+} live_state_t;
+
 typedef struct {
     ws_tx_command_type_t type;
     uint32_t generation;
@@ -54,9 +61,12 @@ extern esp_websocket_client_handle_t client;
 extern volatile bool is_connected;
 extern volatile bool setup_complete;
 extern volatile bool websocket_tx_error;
+extern volatile live_state_t websocket_live_state;
 extern uint32_t websocket_connection_generation;
 extern char session_handle[SESSION_HANDLE_MAX_LEN];
 extern bool session_resumable;
+extern uint32_t websocket_turn_count;
+extern uint32_t websocket_goaway_count;
 
 extern StreamBufferHandle_t audio_stream;
 extern TaskHandle_t audio_playback_task_handle;
