@@ -14,9 +14,12 @@ esp_websocket_client_handle_t client = NULL;
 volatile bool is_connected = false;
 volatile bool setup_complete = false;
 volatile bool websocket_tx_error = false;
+volatile live_state_t websocket_live_state = LIVE_ST_DISCONNECTED;
 uint32_t websocket_connection_generation = 0;
 char session_handle[SESSION_HANDLE_MAX_LEN] = {0};
 bool session_resumable = false;
+uint32_t websocket_turn_count = 0;
+uint32_t websocket_goaway_count = 0;
 
 StreamBufferHandle_t audio_stream = NULL;
 TaskHandle_t audio_playback_task_handle = NULL;
@@ -36,6 +39,7 @@ static QueueHandle_t ws_cleanup_queue = NULL;
 static TaskHandle_t ws_cleanup_task_handle = NULL;
 static int64_t ws_connected_since_us = 0;
 static uint32_t ws_reconnect_count = 0;
+static bool ws_seen_connected = false;
 
 QueueHandle_t websocket_tx_queue = NULL;
 TaskHandle_t websocket_tx_task_handle = NULL;
@@ -90,16 +94,33 @@ void websocket_tx_flush_queue(void)
 
 static void websocket_tx_fail(void)
 {
-    if (websocket_tx_error) return;
     websocket_tx_error = true;
-    is_connected = false;
-    setup_complete = false;
-    ++websocket_connection_generation;
+    websocket_live_state = LIVE_ST_RECONNECTING;
+    ESP_LOGW(TAG, "TX transport unhealthy; waiting for WebSocket lifecycle auto-reconnect (resume=%s)",
+             session_resumable ? "yes" : "no");
     websocket_tx_flush_queue();
-    ESP_LOGW(TAG, "TX transport unhealthy; generation invalidated, stale audio flushed, recovery requested");
-    // Do not call websocket_disconnect() from the realtime TX worker. A failed send in
-    // esp_websocket_client v1.7.0 may already abort the transport, while an explicit
-    // close() can wait for the client task. The supervisor owns the blocking recovery path.
+    // Do not close/destroy the client here. esp_websocket_client owns transport recovery.
+}
+
+static int websocket_send_text_retry(esp_websocket_client_handle_t ws, const char *text,
+                                     size_t total, uint32_t window_ms)
+{
+    if (!ws || !text || total == 0) return -1;
+    size_t sent_total = 0;
+    int64_t deadline = esp_timer_get_time() + (int64_t)window_ms * 1000LL;
+    while (sent_total < total) {
+        if (!esp_websocket_client_is_connected(ws)) return 0;
+        int sent = esp_websocket_client_send_text(ws, text + sent_total,
+                                                   (int)(total - sent_total),
+                                                   pdMS_TO_TICKS(WS_TX_AUDIO_SEND_TIMEOUT_MS));
+        if (sent > 0) {
+            sent_total += (size_t)sent;
+            continue;
+        }
+        if (esp_timer_get_time() >= deadline) break;
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+    return sent_total == total ? (int)sent_total : (sent_total > 0 ? (int)sent_total : 0);
 }
 
 static void websocket_tx_task(void *arg)
@@ -122,9 +143,15 @@ static void websocket_tx_task(void *arg)
             char *setup_json = NULL;
             size_t setup_len = 0;
             if (!build_gemini_setup(&setup_json, &setup_len)) continue;
-            int sent = esp_websocket_client_send_text(ws, setup_json, (int)setup_len, pdMS_TO_TICKS(1000));
-            if (sent != (int)setup_len) websocket_tx_fail();
-            else ESP_LOGI(TAG, "Gemini setup sent: %d bytes", sent);
+            websocket_live_state = LIVE_ST_SETUP_SENT;
+            int sent = websocket_send_text_retry(ws, setup_json, setup_len, 2000);
+            if (sent != (int)setup_len) {
+                ++websocket_tx_write_fail;
+                websocket_tx_fail();
+            } else {
+                ESP_LOGI(TAG, "Gemini setup sent: %d bytes resume=%s", sent,
+                         session_resumable ? "yes" : "no");
+            }
             free(setup_json);
             continue;
         }
@@ -154,8 +181,7 @@ static void websocket_tx_task(void *arg)
 
         int64_t start_us = esp_timer_get_time();
         ++websocket_tx_write_count;
-        int sent = esp_websocket_client_send_text(ws, json_buf, json_len,
-                                                   pdMS_TO_TICKS(WS_TX_AUDIO_SEND_TIMEOUT_MS));
+        int sent = websocket_send_text_retry(ws, json_buf, (size_t)json_len, WS_TX_RETRY_WINDOW_MS);
         uint32_t write_us = (uint32_t)(esp_timer_get_time() - start_us);
         websocket_tx_write_total_us += write_us;
         if (write_us > websocket_tx_write_max_us) websocket_tx_write_max_us = write_us;
@@ -170,16 +196,9 @@ static void websocket_tx_task(void *arg)
         } else {
             ++websocket_tx_write_fail;
             ++websocket_tx_drops;
-            // esp_websocket_client returns zero for a transport write that produced no
-            // bytes; count it as a realtime timeout when the measured call consumed the
-            // configured timeout window. The public API does not expose a dedicated
-            // timeout result, so do not pretend to know more than the API reports.
-            if (sent == 0 && write_us >= (WS_TX_AUDIO_SEND_TIMEOUT_MS * 1000U)) {
-                ++websocket_tx_write_timeout;
-            }
-            ESP_LOGW(TAG, "TX write fail: sent=%d expected=%d write_us=%u timeout=%u",
-                     sent, json_len, (unsigned)write_us,
-                     (unsigned)websocket_tx_write_timeout);
+            if (sent == 0 && write_us >= (WS_TX_AUDIO_SEND_TIMEOUT_MS * 1000U)) ++websocket_tx_write_timeout;
+            ESP_LOGW(TAG, "TX write fail after retry: sent=%d expected=%d write_us=%u timeout=%u",
+                     sent, json_len, (unsigned)write_us, (unsigned)websocket_tx_write_timeout);
             websocket_tx_fail();
         }
     }
@@ -199,11 +218,6 @@ bool websocket_tx_init(void)
         if (xTaskCreatePinnedToCore(websocket_cleanup_task, "ws_cleanup", 3072, NULL, 2, &ws_cleanup_task_handle, 0) != pdPASS) return false;
     }
     if (!websocket_tx_task_handle) {
-        // The esp_websocket_client v1.7.0 send API is synchronous and can block on
-        // TLS/socket backpressure. Keep that blocking path off Core 1, which owns the
-        // 20 ms MIC capture task. Lower priority also prevents TX from starving RX or
-        // playback on Core 0 when transport backpressure occurs. The queue remains
-        // nonblocking and drop-oldest, so realtime freshness is preserved.
         if (xTaskCreatePinnedToCore(websocket_tx_task, "ws_tx", 8192, NULL, 3, &websocket_tx_task_handle, 0) != pdPASS) return false;
     }
     return true;
@@ -255,9 +269,9 @@ void websocket_app_start(void)
     is_connected = false;
     setup_complete = false;
     websocket_tx_error = false;
+    websocket_live_state = LIVE_ST_CONNECTING;
     ws_close_requested = false;
     ws_connected_since_us = 0;
-    ++ws_reconnect_count;
 
     esp_websocket_client_config_t cfg = {};
     cfg.uri = WEBSOCKET_SERVER_URL;
@@ -265,7 +279,7 @@ void websocket_app_start(void)
     cfg.skip_cert_common_name_check = false;
     cfg.cert_common_name = "generativelanguage.googleapis.com";
     cfg.network_timeout_ms = 15000;
-    cfg.disable_auto_reconnect = true;
+    cfg.disable_auto_reconnect = false;
     cfg.keep_alive_enable = true;
     cfg.keep_alive_idle = 30;
     cfg.keep_alive_interval = 10;
@@ -279,7 +293,8 @@ void websocket_app_start(void)
     err = esp_websocket_client_start(client);
     if (err != ESP_OK) { esp_websocket_client_destroy(client); client = NULL; return; }
     ws_started = true;
-    ESP_LOGI(TAG, "Gemini Live client started; reconnect_count=%lu", (unsigned long)ws_reconnect_count);
+    ESP_LOGI(TAG, "Gemini Live client started; reconnect_count=%lu resume=%s",
+             (unsigned long)ws_reconnect_count, session_resumable ? "yes" : "no");
 }
 
 bool websocket_is_connected(void)
@@ -292,8 +307,9 @@ bool websocket_healthcheck(void)
     if (!is_connected || websocket_tx_error) return false;
     if (setup_complete) return true;
     if (ws_connected_since_us != 0 && esp_timer_get_time() - ws_connected_since_us > 15000000LL) {
-        ESP_LOGW(TAG, "Gemini setup timeout; requesting recovery");
-        websocket_disconnect();
+        ESP_LOGW(TAG, "Gemini setup timeout; transport will be allowed to recover automatically");
+        websocket_tx_error = true;
+        websocket_live_state = LIVE_ST_RECONNECTING;
         return false;
     }
     return true;
@@ -322,11 +338,12 @@ void websocket_disconnect(void)
     is_connected = false;
     setup_complete = false;
     websocket_tx_error = true;
+    websocket_live_state = LIVE_ST_DISCONNECTED;
     ++websocket_connection_generation;
     websocket_tx_flush_queue();
     websocket_rx_flush_queue();
     websocket_rx_request_reset();
-    ESP_LOGW(TAG, "Requesting WebSocket close for recovery");
+    ESP_LOGW(TAG, "Requesting WebSocket close for Wi-Fi shutdown");
     esp_err_t err = esp_websocket_client_close(ws, pdMS_TO_TICKS(1000));
     if (err != ESP_OK) ESP_LOGW(TAG, "WebSocket close returned: %s", esp_err_to_name(err));
 }
@@ -346,4 +363,6 @@ void websocket_cleanup_finished(esp_websocket_client_handle_t old_client)
 void websocket_note_connected(void)
 {
     ws_connected_since_us = esp_timer_get_time();
+    if (ws_seen_connected) ++ws_reconnect_count;
+    else ws_seen_connected = true;
 }
