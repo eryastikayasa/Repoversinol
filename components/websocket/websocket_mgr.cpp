@@ -19,7 +19,11 @@ uint32_t websocket_connection_generation = 0;
 char session_handle[SESSION_HANDLE_MAX_LEN] = {0};
 bool session_resumable = false;
 uint32_t websocket_turn_count = 0;
+uint32_t websocket_model_turn_count = 0;
+uint32_t websocket_interrupted_count = 0;
 uint32_t websocket_goaway_count = 0;
+uint32_t websocket_activity_start_count = 0;
+uint32_t websocket_activity_end_count = 0;
 
 StreamBufferHandle_t audio_stream = NULL;
 TaskHandle_t audio_playback_task_handle = NULL;
@@ -99,7 +103,6 @@ static void websocket_tx_fail(void)
     ESP_LOGW(TAG, "TX transport unhealthy; waiting for WebSocket lifecycle auto-reconnect (resume=%s)",
              session_resumable ? "yes" : "no");
     websocket_tx_flush_queue();
-    // Do not close/destroy the client here. esp_websocket_client owns transport recovery.
 }
 
 static int websocket_send_text_retry(esp_websocket_client_handle_t ws, const char *text,
@@ -121,6 +124,21 @@ static int websocket_send_text_retry(esp_websocket_client_handle_t ws, const cha
         vTaskDelay(pdMS_TO_TICKS(5));
     }
     return sent_total == total ? (int)sent_total : (sent_total > 0 ? (int)sent_total : 0);
+}
+
+static bool websocket_tx_send_control(esp_websocket_client_handle_t ws, const char *json,
+                                      uint32_t counter, const char *label)
+{
+    const size_t len = strlen(json);
+    const int sent = websocket_send_text_retry(ws, json, len, WS_TX_RETRY_WINDOW_MS);
+    if (sent != (int)len) {
+        ++websocket_tx_write_fail;
+        ESP_LOGW(TAG, "%s failed sent=%d expected=%u", label, sent, (unsigned)len);
+        websocket_tx_fail();
+        return false;
+    }
+    (void)counter;
+    return true;
 }
 
 static void websocket_tx_task(void *arg)
@@ -153,6 +171,20 @@ static void websocket_tx_task(void *arg)
                          session_resumable ? "yes" : "no");
             }
             free(setup_json);
+            continue;
+        }
+
+        if (cmd.type == WS_TX_COMMAND_ACTIVITY_START) {
+            const char *json = "{\"realtimeInput\":{\"activityStart\":{}}}";
+            if (websocket_tx_send_control(ws, json, ++websocket_activity_start_count, "activityStart"))
+                ESP_LOGI(TAG, "Gemini activityStart sent");
+            continue;
+        }
+
+        if (cmd.type == WS_TX_COMMAND_ACTIVITY_END) {
+            const char *json = "{\"realtimeInput\":{\"activityEnd\":{}}}";
+            if (websocket_tx_send_control(ws, json, ++websocket_activity_end_count, "activityEnd"))
+                ESP_LOGI(TAG, "Gemini activityEnd sent");
             continue;
         }
 
@@ -221,6 +253,30 @@ bool websocket_tx_init(void)
         if (xTaskCreatePinnedToCore(websocket_tx_task, "ws_tx", 8192, NULL, 3, &websocket_tx_task_handle, 0) != pdPASS) return false;
     }
     return true;
+}
+
+static bool websocket_tx_enqueue_control(ws_tx_command_type_t type, uint32_t generation)
+{
+    if (!websocket_tx_queue || !is_connected || !setup_complete || websocket_tx_error ||
+        generation != websocket_connection_generation) return false;
+    ws_tx_command_t cmd = {};
+    cmd.type = type;
+    cmd.generation = generation;
+    if (xQueueSend(websocket_tx_queue, &cmd, pdMS_TO_TICKS(100)) != pdTRUE) {
+        ESP_LOGW(TAG, "TX control queue full type=%d", (int)type);
+        return false;
+    }
+    return true;
+}
+
+bool websocket_tx_enqueue_activity_start(uint32_t generation)
+{
+    return websocket_tx_enqueue_control(WS_TX_COMMAND_ACTIVITY_START, generation);
+}
+
+bool websocket_tx_enqueue_activity_end(uint32_t generation)
+{
+    return websocket_tx_enqueue_control(WS_TX_COMMAND_ACTIVITY_END, generation);
 }
 
 bool websocket_tx_enqueue_audio(const uint8_t *data, size_t len, uint32_t generation)
