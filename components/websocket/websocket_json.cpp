@@ -1,6 +1,7 @@
 #include "websocket_internal.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_websocket_client.h"
 #include "mbedtls/base64.h"
 #include "cJSON.h"
 #include <stdlib.h>
@@ -9,6 +10,7 @@
 
 static const char *TAG = "WS_JSON";
 static uint8_t pcm_decode_buffer[24 * 1024];
+static volatile bool goaway_reconnect_pending = false;
 
 void clear_session_handle(void) { session_handle[0] = '\0'; session_resumable = false; }
 
@@ -19,6 +21,7 @@ bool store_session_handle(const char *handle)
     if (len >= sizeof(session_handle)) return false;
     memcpy(session_handle, handle, len + 1);
     session_resumable = true;
+    ESP_LOGI(TAG, "Gemini session resumption handle updated (%u bytes)", (unsigned)len);
     return true;
 }
 
@@ -52,8 +55,6 @@ bool build_gemini_setup(char **output, size_t *output_len)
     if (session_resumable && session_handle[0])
         cJSON_AddStringToObject(resume, "handle", session_handle);
 
-    /* Live API uses one compression mechanism. SlidingWindow is the mechanism;
-       targetTokens controls how much context is retained after compression. */
     cJSON *compression = cJSON_AddObjectToObject(setup, "contextWindowCompression");
     cJSON *window = cJSON_AddObjectToObject(compression, "slidingWindow");
     cJSON_AddNumberToObject(window, "targetTokens", 12500);
@@ -62,7 +63,8 @@ bool build_gemini_setup(char **output, size_t *output_len)
     cJSON_Delete(root);
     if (!json) return false;
     *output = json; *output_len = strlen(json);
-    ESP_LOGI(TAG, "Gemini setup: AUDIO + AAD + session resumption + sliding-window compression");
+    ESP_LOGI(TAG, "Gemini setup: AUDIO + AAD + session resumption + sliding-window compression resume=%s",
+             session_resumable ? "yes" : "no");
     return true;
 }
 
@@ -100,7 +102,8 @@ void process_gemini_message(const char *json, size_t len)
     cJSON *setup_obj = cJSON_GetObjectItem(root, "setupComplete");
     if (cJSON_IsObject(setup_obj)) {
         ::setup_complete = true;
-        ESP_LOGI(TAG, "Gemini SETUP COMPLETE");
+        websocket_live_state = LIVE_ST_READY;
+        ESP_LOGI(TAG, "Gemini SETUP COMPLETE; multi-turn READY");
     }
 
     cJSON *resume_update = cJSON_GetObjectItem(root, "sessionResumptionUpdate");
@@ -108,6 +111,14 @@ void process_gemini_message(const char *json, size_t len)
         cJSON *handle = cJSON_GetObjectItem(resume_update, "newHandle");
         cJSON *resumable = cJSON_GetObjectItem(resume_update, "resumable");
         if (cJSON_IsTrue(resumable) && cJSON_IsString(handle)) store_session_handle(handle->valuestring);
+    }
+
+    cJSON *goaway = cJSON_GetObjectItem(root, "goAway");
+    if (cJSON_IsObject(goaway)) {
+        ++websocket_goaway_count;
+        goaway_reconnect_pending = true;
+        websocket_live_state = LIVE_ST_RECONNECTING;
+        ESP_LOGW(TAG, "Gemini goAway received; reconnecting with saved resume handle");
     }
 
     cJSON *server = cJSON_GetObjectItem(root, "serverContent");
@@ -121,17 +132,26 @@ void process_gemini_message(const char *json, size_t len)
                 if (cJSON_IsObject(inline_data) && !decode_audio(inline_data))
                     ESP_LOGW(TAG, "RX audio decode/queue failed");
             }
+            if (cJSON_GetArraySize(parts) > 0) websocket_live_state = LIVE_ST_SPEAKING;
         }
         if (cJSON_IsTrue(cJSON_GetObjectItem(server, "turnComplete"))) {
+            ++websocket_turn_count;
             audio_turn_complete_pending = true;
+            websocket_live_state = LIVE_ST_READY;
             check_audio_playback_complete();
-            ESP_LOGI(TAG, "Gemini TURN COMPLETE");
+            ESP_LOGI(TAG, "Gemini TURN COMPLETE; turn=%lu ready_for_next=yes",
+                     (unsigned long)websocket_turn_count);
         }
         if (cJSON_IsTrue(cJSON_GetObjectItem(server, "interrupted"))) {
             clear_audio_buffer();
             audio_turn_complete_pending = false;
             audio_turn_active = false;
+            websocket_live_state = LIVE_ST_READY;
+            ESP_LOGI(TAG, "Gemini TURN INTERRUPTED; audio flushed, READY");
         }
     }
     cJSON_Delete(root);
 }
+
+bool websocket_goaway_reconnect_pending(void) { return goaway_reconnect_pending; }
+void websocket_clear_goaway_reconnect(void) { goaway_reconnect_pending = false; }
