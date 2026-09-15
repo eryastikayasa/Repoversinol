@@ -1,6 +1,7 @@
 #include "wifi_manager.h"
 #include "websocket_mgr.h"
 #include "audio_hal.h"
+#include "websocket_internal.h"
 #include "esp_log.h"
 #include "esp_wifi.h"
 #include "esp_timer.h"
@@ -102,7 +103,7 @@ static void audio_capture_task(void *arg)
                      (unsigned long)websocket_tx_write_slow,
                      (unsigned long)websocket_tx_write_fail,
                      (unsigned long)websocket_tx_write_timeout);
-            ESP_LOGI(TAG, "RX profile: q=%u/4 hwm=%u msg=%lu frag=%lu drops=%lu process_avg_us=%lu process_max_us=%lu | WiFi reconnect=%lu WS reconnect=%lu",
+            ESP_LOGI(TAG, "RX profile: q=%u/4 hwm=%u msg=%lu frag=%lu drops=%lu process_avg_us=%lu process_max_us=%lu | WiFi reconnect=%lu WS reconnect=%lu turns=%lu resume=%s goAway=%lu",
                      (unsigned)websocket_get_rx_queue_depth(),
                      (unsigned)websocket_rx_high_water,
                      (unsigned long)websocket_rx_messages,
@@ -111,7 +112,10 @@ static void audio_capture_task(void *arg)
                      (unsigned long)rx_avg,
                      (unsigned long)websocket_rx_process_max_us,
                      (unsigned long)wifi_get_reconnect_count(),
-                     (unsigned long)websocket_get_reconnect_count());
+                     (unsigned long)websocket_get_reconnect_count(),
+                     (unsigned long)websocket_turn_count,
+                     session_resumable ? "yes" : "no",
+                     (unsigned long)websocket_goaway_count);
         }
     }
 }
@@ -122,19 +126,26 @@ static void session_supervisor_task(void *arg)
     for (;;) {
         const bool wifi_ready = wifi_is_ready();
 
-        // Network/TX failure invalidates the voice session immediately; audio capture keeps its 20 ms cadence.
         if (!wifi_ready) {
             websocket_disconnect();
+        } else if (websocket_goaway_reconnect_pending() && client) {
+            // goAway is a proactive server request. Stop/start the SAME client so the
+            // saved Gemini session-resumption handle is reused on the next setup.
+            ESP_LOGW(TAG, "WS supervisor: proactive reconnect for goAway, resume=%s",
+                     session_resumable ? "yes" : "no");
+            websocket_clear_goaway_reconnect();
+            websocket_tx_error = true;
+            websocket_live_state = LIVE_ST_RECONNECTING;
+            websocket_tx_flush_queue();
+            esp_websocket_client_stop(client);
         } else if (websocket_tx_error) {
-            // esp_websocket_client v1.7.0 aborts the connection itself after a transport
-            // send failure and drives the ERROR/DISCONNECTED/FINISH lifecycle. Do not
-            // issue a second blocking close here. websocket_app_start() has its own
-            // client/ws_started/cleanup guards, so it is safe to call until FINISH
-            // clears the old client; it then creates the fresh session.
-            websocket_app_start();
+            // With auto reconnect enabled, keep the existing client alive. The client
+            // will emit CONNECTED again; that event queues a fresh setup using the
+            // preserved session-resumption handle.
+            if (!client) websocket_app_start();
         } else {
             (void)websocket_healthcheck();
-            if (!websocket_is_connected()) websocket_app_start();
+            if (!client) websocket_app_start();
         }
 
         vTaskDelay(pdMS_TO_TICKS(500));
@@ -158,7 +169,6 @@ extern "C" void app_main()
     wifi_init_sta();
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 
-    // Do not block boot on a 15 s Wi-Fi timeout. The supervisor owns recovery and will start Gemini after GOT_IP.
     if (!wifi_wait_for_connection(5000))
         ESP_LOGW(TAG, "Wi-Fi not ready yet; continuing with offline-safe voice workers");
 
