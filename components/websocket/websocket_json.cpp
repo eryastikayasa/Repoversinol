@@ -49,7 +49,7 @@ bool build_gemini_setup(char **output, size_t *output_len)
 
     cJSON *realtime = cJSON_AddObjectToObject(setup, "realtimeInputConfig");
     cJSON *aad = cJSON_AddObjectToObject(realtime, "automaticActivityDetection");
-    cJSON_AddBoolToObject(aad, "disabled", false);
+    cJSON_AddBoolToObject(aad, "disabled", true);
 
     cJSON *resume = cJSON_AddObjectToObject(setup, "sessionResumption");
     if (session_resumable && session_handle[0])
@@ -63,7 +63,7 @@ bool build_gemini_setup(char **output, size_t *output_len)
     cJSON_Delete(root);
     if (!json) return false;
     *output = json; *output_len = strlen(json);
-    ESP_LOGI(TAG, "Gemini setup: AUDIO + AAD + session resumption + sliding-window compression resume=%s",
+    ESP_LOGI(TAG, "Gemini setup: AUDIO + MANUAL AAD + session resumption + compression resume=%s",
              session_resumable ? "yes" : "no");
     return true;
 }
@@ -126,6 +126,7 @@ void process_gemini_message(const char *json, size_t len)
         cJSON *turn = cJSON_GetObjectItem(server, "modelTurn");
         cJSON *parts = turn ? cJSON_GetObjectItem(turn, "parts") : NULL;
         if (cJSON_IsArray(parts)) {
+            if (cJSON_GetArraySize(parts) > 0) ++websocket_model_turn_count;
             cJSON *part = NULL;
             cJSON_ArrayForEach(part, parts) {
                 cJSON *inline_data = cJSON_GetObjectItem(part, "inlineData");
@@ -143,6 +144,7 @@ void process_gemini_message(const char *json, size_t len)
                      (unsigned long)websocket_turn_count);
         }
         if (cJSON_IsTrue(cJSON_GetObjectItem(server, "interrupted"))) {
+            ++websocket_interrupted_count;
             clear_audio_buffer();
             audio_turn_complete_pending = false;
             audio_turn_active = false;
