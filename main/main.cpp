@@ -12,7 +12,7 @@
 #include "freertos/task.h"
 #include <stdint.h>
 #include <stddef.h>
-#include <math.h>
+#include <cmath>
 
 #ifndef VOICE_SYNTHETIC_TEST
 #define VOICE_SYNTHETIC_TEST 0
@@ -32,7 +32,7 @@ static uint32_t pcm_rms(const uint8_t *data, size_t len)
         const int32_t s = samples[i];
         sum_sq += (uint64_t)(s * s);
     }
-    return count ? (uint32_t)sqrt((double)sum_sq / (double)count) : 0;
+    return count ? (uint32_t)std::sqrt((double)sum_sq / (double)count) : 0;
 }
 
 static void audio_capture_task(void *arg)
